@@ -95,9 +95,13 @@ letters into Ctrl+Alt+Super+letter, which leaves Super+letter free:
 ```lisp
 (defalias tab-apps (tap-hold-release 200 200 tab (layer-while-held apps)))
 (deflayermap (base) tab @tab-apps)
-(deflayermap (apps) a C-A-M-a  b C-A-M-b  c C-A-M-c  ;; ... through z
-                    / C-A-M-/)
+(deflayermap (apps) a (macro C-A-M-a)  b (macro C-A-M-b)  ;; ... through z
+                    / (macro C-A-M-/))
 ```
+
+Use `macro` rather than a bare output chord such as `C-A-M-a`. With `tap-hold-release`, kanata
+may replay the letter's press and release in the same instant, and a bare chord then sends
+nothing; a macro always sends the full press and release.
 
 Then bind `W-C-A-<letter>` to `keydock key <letter>` and set `key_label = "Tab"`.
 
