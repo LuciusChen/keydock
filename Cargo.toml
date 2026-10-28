@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Pin apps to Super+letter keys on wlroots compositors"
 license = "MIT"
+repository = "https://github.com/LuciusChen/keydock"
+homepage = "https://github.com/LuciusChen/keydock"
+readme = "README.md"
+keywords = ["wayland", "wlroots", "hotkeys", "window-switcher", "labwc"]
+categories = ["command-line-utilities", "gui"]
 
 [dependencies]
 smithay-client-toolkit = "0.21"

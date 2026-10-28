@@ -15,6 +15,17 @@ Pin applications to Super+letter keys on wlroots compositors (labwc, niri, Hyprl
 keydock tracks its own most-recently-used window order through
 `wlr-foreign-toplevel-management`, so the behaviour does not depend on compositor internals.
 The overlay is a layer-shell surface drawn with cairo and pango, with fractional scaling.
+Its labels are currently in Chinese.
+
+## Commands
+
+```text
+keydock key <letter>   focus, hide or launch the app pinned to <letter>
+keydock overlay        show or hide the overlay
+keydock status         list tracked windows, most recently used first
+keydock reload         re-read desktop entries and icons
+keydock daemon         run the background service (other commands start it if needed)
+```
 
 ## Configuration
 
@@ -30,8 +41,26 @@ app_id = "kitty"       # as shown by `keydock status`; "emacs" also matches "ema
 exec = "kitty"         # launch command when no window exists
 ```
 
-Overlay colors come from `~/.config/keydock/colors.toml` (`surface`, `on_surface`,
-`on_surface_variant`, `primary`, `outline` as hex), which a Noctalia user template writes.
+Overlay colors are read from `~/.config/keydock/colors.toml` each time the overlay opens;
+without it a dark default palette is used:
+
+```toml
+surface = "#282828"
+on_surface = "#fbf1c7"
+on_surface_variant = "#ebdbb2"
+primary = "#b8bb26"
+outline = "#57514e"
+```
+
+With [Noctalia](https://github.com/noctalia-dev/noctalia), a user template keeps it in sync
+with the shell palette. Put the file above in `~/.config/noctalia/templates/keydock.toml` with
+values such as `"{{colors.primary.default.hex}}"`, and register it in Noctalia's config:
+
+```toml
+[theme.templates.user.keydock]
+input_path = "$XDG_CONFIG_HOME/noctalia/templates/keydock.toml"
+output_path = "$XDG_CONFIG_HOME/keydock/colors.toml"
+```
 
 ## Compositor support
 
@@ -52,6 +81,25 @@ Bind every free Super+letter to `keydock key <letter>` (on release), Super+/ to
 
 Start `keydock daemon` from the session autostart. Any other command starts it if needed.
 
+## Other compositors (untested)
+
+Bind the same commands; the cursor-warp chord is only needed where the compositor does not
+move the pointer to the focused window by itself.
+
+```text
+# sway
+bindsym --release Mod4+c exec keydock key c
+bindsym Mod4+slash exec keydock overlay
+
+# Hyprland
+bindr = SUPER, C, exec, keydock key c
+bind = SUPER, slash, exec, keydock overlay
+
+# niri (binds section)
+Mod+C { spawn "keydock" "key" "c"; }
+Mod+Slash { spawn "keydock" "overlay"; }
+```
+
 ## Build
 
 ```sh
@@ -59,3 +107,7 @@ cargo build --release && install -Dm755 target/release/keydock ~/.local/bin/keyd
 ```
 
 Needs cairo, pango and libxkbcommon at runtime.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
