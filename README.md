@@ -5,6 +5,9 @@ Pin applications to Super+letter keys on wlroots compositors (labwc, niri, Hyprl
 - **Super+letter** focuses the pinned app, hides it when it is already focused, or launches it.
   All of the app's windows come forward together and the most recently used one ends on top.
   Windows you minimized one by one stay minimized.
+- **Hiding** minimizes the app's windows. Tiling compositors (niri, Hyprland, sway) ignore
+  minimize requests; keydock notices on the first hide and switches to focusing the previous
+  app instead, like Cmd+Tab. `keydock status` shows which behaviour is in use.
 - **Super+/** shows an overlay with the pinned apps and the open, unpinned apps. Letters and
   numbers in the overlay switch to an app; Esc closes it.
 - **An unpinned Super+letter** opens the overlay so you can pin an open app to that letter.
@@ -19,6 +22,7 @@ The overlay is a layer-shell surface drawn with cairo and pango, with fractional
 
 ```toml
 font = "sans"          # optional overlay font
+hide = "auto"          # auto | minimize | previous (focus the previous app)
 
 [[app]]
 key = "c"
@@ -28,6 +32,12 @@ exec = "kitty"         # launch command when no window exists
 
 Overlay colors come from `~/.config/keydock/colors.toml` (`surface`, `on_surface`,
 `on_surface_variant`, `primary`, `outline` as hex), which a Noctalia user template writes.
+
+## Compositor support
+
+Requires `wlr-foreign-toplevel-management` and `wlr-layer-shell`; `virtual-keyboard` is used for
+the cursor warp, and `fractional-scale` with `viewporter` for crisp text. Tested on labwc.
+niri, Hyprland and sway implement these protocols but are untested; GNOME and KDE do not.
 
 ## Compositor setup (labwc)
 

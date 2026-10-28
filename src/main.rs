@@ -18,7 +18,11 @@ use smithay_client_toolkit::{
     delegate_dispatch2, delegate_registry,
     dispatch2::Dispatch2,
     output::{OutputHandler, OutputState},
-    reexports::calloop::{EventLoop, Interest, Mode as IoMode, PostAction, generic::Generic},
+    reexports::calloop::{
+        EventLoop, Interest, LoopHandle, Mode as IoMode, PostAction,
+        generic::Generic,
+        timer::{TimeoutAction, Timer},
+    },
     reexports::calloop_wayland_source::WaylandSource,
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -137,6 +141,7 @@ pub struct State {
     viewporter: Option<WpViewporter>,
     qh: QueueHandle<State>,
     conn: Connection,
+    event_loop: LoopHandle<'static, State>,
     pub windows: Windows,
     pub overlay: Overlay,
     /// App ids behind the overlay's number keys, in display order.
@@ -168,6 +173,7 @@ fn daemon() -> Result<(), String> {
         .map_err(|_| missing("wlr-foreign-toplevel-management"))?;
     let vk_manager = globals.bind(&qh, 1..=1, Noop).ok();
 
+    let mut event_loop: EventLoop<State> = EventLoop::try_new().map_err(|e| e.to_string())?;
     let mut state = State {
         registry: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
@@ -179,6 +185,7 @@ fn daemon() -> Result<(), String> {
         viewporter: globals.bind(&qh, 1..=1, Noop).ok(),
         qh: qh.clone(),
         conn: conn.clone(),
+        event_loop: event_loop.handle(),
         windows: Windows::new(vk_manager),
         overlay: Overlay::new(),
         overlay_targets: Vec::new(),
@@ -187,7 +194,6 @@ fn daemon() -> Result<(), String> {
         icons: IconFinder::new(),
     };
 
-    let mut event_loop: EventLoop<State> = EventLoop::try_new().map_err(|e| e.to_string())?;
     WaylandSource::new(conn, queue).insert(event_loop.handle()).map_err(|e| e.to_string())?;
     event_loop
         .handle()
@@ -258,14 +264,30 @@ impl State {
         if self.overlay.is_open() {
             self.overlay.close();
         }
-        match cfg.by_key(&key.to_string()) {
-            Some(app) => self.windows.toggle(&self.qh, &app.app_id, app.exec.as_deref()),
-            None => self.open_overlay(Mode::Assign(key)),
+        let Some(app) = cfg.by_key(&key.to_string()) else { return self.open_overlay(Mode::Assign(key)) };
+        if let Some(check) = self.windows.toggle(&self.qh, &app.app_id, app.exec.as_deref(), cfg.hide)? {
+            // Give the compositor time to report the minimized state.
+            let timer = Timer::from_duration(Duration::from_millis(150));
+            let mut check = Some(check);
+            let _ = self.event_loop.insert_source(timer, move |_, _, state| {
+                if let Some(check) = check.take() {
+                    state.windows.check_minimized(&state.qh, check);
+                    let _ = state.conn.flush();
+                }
+                TimeoutAction::Drop
+            });
         }
+        Ok(())
     }
 
     fn status(&self) -> String {
-        self.windows
+        let minimize = match self.windows.minimize_works {
+            Some(true) => "supported",
+            Some(false) => "ignored by compositor, hiding focuses the previous app",
+            None => "not tested yet",
+        };
+        let windows = self
+            .windows
             .list
             .iter()
             .map(|w| {
@@ -277,7 +299,8 @@ impl State {
                 format!("{}\t{}{}", w.app_id, w.title, flags)
             })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        format!("# minimize: {minimize}\n{windows}")
     }
 
     fn reload_desktop(&mut self) {

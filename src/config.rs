@@ -29,10 +29,26 @@ pub fn app_id_matches(wanted: &str, actual: &str) -> bool {
     a == w || a.strip_prefix(&w).is_some_and(|rest| rest.starts_with('-'))
 }
 
+/// What pressing the key of the focused app does.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Hide {
+    /// Minimize when the compositor supports it, otherwise "previous".
+    #[default]
+    Auto,
+    /// Minimize all of the app's windows.
+    Minimize,
+    /// Focus the most recently used window of another app, like Cmd+Tab.
+    /// Tiling compositors (niri, Hyprland, sway) ignore minimize requests.
+    Previous,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     /// Font family for the overlay, e.g. "Inter" or "sans".
     pub font: Option<String>,
+    #[serde(default)]
+    pub hide: Hide,
     #[serde(default, rename = "app")]
     pub apps: Vec<AppEntry>,
 }

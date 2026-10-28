@@ -25,7 +25,7 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
 };
 
 use crate::State;
-use crate::config::app_id_matches;
+use crate::config::{Hide, app_id_matches};
 
 pub struct Window {
     pub handle: ZwlrForeignToplevelHandleV1,
@@ -51,6 +51,14 @@ pub struct Windows {
     vk_manager: Option<ZwpVirtualKeyboardManagerV1>,
     vk: Option<(ZwpVirtualKeyboardV1, u32)>,
     time: Instant,
+    /// Learned on the first automatic hide: some compositors ignore minimize requests.
+    pub minimize_works: Option<bool>,
+}
+
+/// Windows whose minimize request still needs confirming (see `Hide::Auto`).
+pub struct MinimizeCheck {
+    pub app_id: String,
+    pub windows: Vec<u32>,
 }
 
 fn key_of(handle: &ZwlrForeignToplevelHandleV1) -> u32 {
@@ -67,6 +75,7 @@ impl Windows {
             vk_manager,
             vk: None,
             time: Instant::now(),
+            minimize_works: None,
         }
     }
 
@@ -88,13 +97,19 @@ impl Windows {
     }
 
     /// Focuses the app, hides it when it is already focused, or launches it.
-    pub fn toggle(&mut self, qh: &QueueHandle<State>, app_id: &str, exec: Option<&str>) -> Result<(), String> {
+    /// Returns windows to re-check when minimize support is not known yet.
+    pub fn toggle(
+        &mut self,
+        qh: &QueueHandle<State>,
+        app_id: &str,
+        exec: Option<&str>,
+        hide: Hide,
+    ) -> Result<Option<MinimizeCheck>, String> {
         let focused = self.active().is_some_and(|w| app_id_matches(app_id, &w.app_id));
         if focused {
-            self.hide(app_id);
-            Ok(())
+            Ok(self.hide(qh, app_id, hide))
         } else {
-            self.show(qh, app_id, exec)
+            self.show(qh, app_id, exec).map(|_| None)
         }
     }
 
@@ -128,18 +143,74 @@ impl Windows {
         Ok(())
     }
 
+    /// Hides the app: minimizes its windows, or focuses the previous app
+    /// where minimizing is unsupported or not wanted.
+    pub fn hide(&mut self, qh: &QueueHandle<State>, app_id: &str, mode: Hide) -> Option<MinimizeCheck> {
+        let minimize = match mode {
+            Hide::Minimize => true,
+            Hide::Previous => false,
+            Hide::Auto => self.minimize_works != Some(false),
+        };
+        if !minimize {
+            self.focus_previous(qh, app_id);
+            return None;
+        }
+        let keys = self.minimize_all(app_id);
+        (mode == Hide::Auto && self.minimize_works.is_none() && !keys.is_empty())
+            .then(|| MinimizeCheck { app_id: app_id.to_string(), windows: keys })
+    }
+
     /// Minimizes every window of the app, the focused one last so focus
     /// moves to another app instead of a sibling window.
-    pub fn hide(&mut self, app_id: &str) {
+    fn minimize_all(&mut self, app_id: &str) -> Vec<u32> {
         let mut wins: Vec<(ZwlrForeignToplevelHandleV1, bool)> = self
             .of_app(app_id)
             .filter(|w| !w.minimized)
             .map(|w| (w.handle.clone(), w.activated))
             .collect();
         wins.sort_by_key(|(_, active)| *active);
+        let mut keys = Vec::new();
         for (h, _) in wins {
             h.set_minimized();
             self.hidden.insert(key_of(&h));
+            keys.push(key_of(&h));
+        }
+        keys
+    }
+
+    /// Called shortly after an automatic hide: if none of the windows became
+    /// minimized, the compositor ignores minimize requests, so remember that
+    /// and fall back to focusing the previous app.
+    pub fn check_minimized(&mut self, qh: &QueueHandle<State>, check: MinimizeCheck) {
+        if self.minimize_works.is_some() {
+            return;
+        }
+        let tracked: Vec<&Window> = self.list.iter().filter(|w| check.windows.contains(&key_of(&w.handle))).collect();
+        if tracked.is_empty() {
+            return; // windows closed meanwhile; decide next time
+        }
+        if tracked.iter().any(|w| w.minimized) {
+            self.minimize_works = Some(true);
+        } else {
+            self.minimize_works = Some(false);
+            for k in &check.windows {
+                self.hidden.remove(k);
+            }
+            self.focus_previous(qh, &check.app_id);
+        }
+    }
+
+    /// Focuses the most recently used visible window of any other app.
+    fn focus_previous(&mut self, qh: &QueueHandle<State>, app_id: &str) {
+        let Some(seat) = self.seat.clone() else { return };
+        let target = self
+            .list
+            .iter()
+            .find(|w| !w.minimized && !w.app_id.is_empty() && !app_id_matches(app_id, &w.app_id))
+            .map(|w| w.handle.clone());
+        if let Some(h) = target {
+            h.activate(&seat);
+            self.warp_pointer(qh);
         }
     }
 
