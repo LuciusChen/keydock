@@ -2,6 +2,7 @@
 name = "keydock"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Pin apps to Super+letter keys on wlroots compositors"
 license = "MIT"
 repository = "https://github.com/LuciusChen/keydock"

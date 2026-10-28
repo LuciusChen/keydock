@@ -3,22 +3,24 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use smithay_client_toolkit::shell::WaylandSurface;
-use smithay_client_toolkit::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerSurface};
-use smithay_client_toolkit::shm::{Shm, slot::SlotPool};
 use smithay_client_toolkit::compositor::CompositorState;
-use wayland_client::protocol::wl_shm;
 use smithay_client_toolkit::dispatch2::Dispatch2;
+use smithay_client_toolkit::shell::WaylandSurface;
+use smithay_client_toolkit::shell::wlr_layer::{
+    Anchor, KeyboardInteractivity, Layer, LayerShell, LayerSurface,
+};
+use smithay_client_toolkit::shm::{Shm, slot::SlotPool};
+use wayland_client::protocol::{wl_shm, wl_surface::WlSurface};
 use wayland_client::{Connection, QueueHandle};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
     wp_fractional_scale_v1::{self, WpFractionalScaleV1},
 };
-use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
 
-use crate::Noop;
-
-use crate::State;
+use crate::{Noop, State};
 
 pub enum Mode {
     /// Super+/: shows pinned apps and gives open, unpinned apps number keys.
@@ -55,7 +57,11 @@ struct Rgba(f64, f64, f64, f64);
 impl Rgba {
     fn hex(s: &str) -> Option<Rgba> {
         let s = s.trim().trim_start_matches('#');
-        let v = |i: usize| u8::from_str_radix(s.get(i..i + 2)?, 16).ok().map(|x| x as f64 / 255.0);
+        let v = |i: usize| {
+            u8::from_str_radix(s.get(i..i + 2)?, 16)
+                .ok()
+                .map(|x| x as f64 / 255.0)
+        };
         let a = if s.len() >= 8 { v(6)? } else { 1.0 };
         Some(Rgba(v(0)?, v(2)?, v(4)?, a))
     }
@@ -86,8 +92,12 @@ impl Theme {
             outline: Rgba(0.35, 0.35, 0.40, 1.0),
         };
         let path = crate::config::Config::path().with_file_name("colors.toml");
-        let Ok(text) = std::fs::read_to_string(path) else { return t };
-        let Ok(table) = text.parse::<toml::Table>() else { return t };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return t;
+        };
+        let Ok(table) = text.parse::<toml::Table>() else {
+            return t;
+        };
         let get = |k: &str| table.get(k).and_then(|v| v.as_str()).and_then(Rgba::hex);
         for (k, slot) in [
             ("surface", &mut t.surface),
@@ -116,7 +126,16 @@ const HINT_H: f64 = 26.0;
 const MIN_W: f64 = 300.0;
 const MAX_NAME_W: f64 = 360.0;
 
+/// Globals the overlay needs; fractional scaling is optional.
+pub struct Globals {
+    pub compositor: CompositorState,
+    pub layer_shell: LayerShell,
+    pub fractional: Option<WpFractionalScaleManagerV1>,
+    pub viewporter: Option<WpViewporter>,
+}
+
 pub struct Overlay {
+    globals: Globals,
     pub mode: Option<Mode>,
     content: Option<Content>,
     layer: Option<LayerSurface>,
@@ -133,8 +152,9 @@ pub struct Overlay {
 }
 
 impl Overlay {
-    pub fn new() -> Self {
+    pub fn new(globals: Globals) -> Self {
         Overlay {
+            globals,
             mode: None,
             content: None,
             layer: None,
@@ -154,18 +174,16 @@ impl Overlay {
         self.layer.is_some()
     }
 
-    pub fn owns(&self, surface: &wayland_client::protocol::wl_surface::WlSurface) -> bool {
-        self.layer.as_ref().is_some_and(|l| l.wl_surface() == surface)
+    pub fn owns(&self, surface: &WlSurface) -> bool {
+        self.layer
+            .as_ref()
+            .is_some_and(|l| l.wl_surface() == surface)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Shows `content`, or replaces what an open overlay shows.
     pub fn open(
         &mut self,
         qh: &QueueHandle<State>,
-        compositor: &CompositorState,
-        layer_shell: &LayerShell,
-        fractional: Option<&WpFractionalScaleManagerV1>,
-        viewporter: Option<&WpViewporter>,
         mode: Mode,
         content: Content,
         font: Option<&str>,
@@ -181,12 +199,15 @@ impl Overlay {
             layer.commit();
             return;
         }
-        let surface = compositor.create_surface(qh);
-        let layer = layer_shell.create_layer_surface(qh, surface, Layer::Overlay, Some("keydock"), None);
+        let g = &self.globals;
+        let surface = g.compositor.create_surface(qh);
+        let layer =
+            g.layer_shell
+                .create_layer_surface(qh, surface, Layer::Overlay, Some("keydock"), None);
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         layer.set_anchor(Anchor::empty());
         layer.set_size(w, h);
-        if let (Some(f), Some(v)) = (fractional, viewporter) {
+        if let (Some(f), Some(v)) = (&g.fractional, &g.viewporter) {
             self.fractional = Some(f.get_fractional_scale(layer.wl_surface(), qh, Scale));
             self.viewport = Some(v.get_viewport(layer.wl_surface(), qh, Noop));
         }
@@ -222,9 +243,12 @@ impl Overlay {
     }
 
     fn measure(&self, content: &Content) -> (u32, u32) {
-        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).expect("cairo surface");
+        let surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).expect("cairo surface");
         let cr = cairo::Context::new(&surface).expect("cairo context");
-        let text_w = |t: &str, px: f64, bold: bool| text_layout(&cr, &self.font, t, px, bold).pixel_size().0 as f64;
+        let text_w = |t: &str, px: f64, bold: bool| {
+            text_layout(&cr, &self.font, t, px, bold).pixel_size().0 as f64
+        };
         let mut name_w: f64 = 0.0;
         let mut h = PAD * 2.0 + HINT_H;
         let mut other_w = text_w(&content.hint, 11.5, false);
@@ -244,29 +268,53 @@ impl Overlay {
     }
 
     fn draw(&mut self, shm: &Shm) {
-        let Some(content) = self.content.as_ref() else { return };
+        let Some(content) = self.content.as_ref() else {
+            return;
+        };
         if self.layer.is_none() {
             return;
         }
         let (w, h) = self.size;
         let scale = self.scale120 as f64 / 120.0;
         // Without viewporter, fall back to integer buffer scaling.
-        let scale = if self.viewport.is_some() { scale } else { scale.ceil() };
-        let (bw, bh) = ((w as f64 * scale).ceil() as i32, (h as f64 * scale).ceil() as i32);
+        let scale = if self.viewport.is_some() {
+            scale
+        } else {
+            scale.ceil()
+        };
+        let (bw, bh) = (
+            (w as f64 * scale).ceil() as i32,
+            (h as f64 * scale).ceil() as i32,
+        );
         let stride = bw * 4;
 
         let px = (scale * ICON).round() as i32;
-        let paths: Vec<Option<PathBuf>> =
-            content.sections.iter().flat_map(|s| s.rows.iter()).map(|r| r.icon.clone()).collect();
-        let icons: Vec<Option<cairo::ImageSurface>> =
-            paths.into_iter().map(|p| p.and_then(|p| self.icon(&p, px))).collect();
+        let paths: Vec<Option<PathBuf>> = content
+            .sections
+            .iter()
+            .flat_map(|s| s.rows.iter())
+            .map(|r| r.icon.clone())
+            .collect();
+        let icons: Vec<Option<cairo::ImageSurface>> = paths
+            .into_iter()
+            .map(|p| p.and_then(|p| self.icon(&p, px)))
+            .collect();
 
-        let image = cairo::ImageSurface::create(cairo::Format::ARgb32, bw, bh).expect("cairo surface");
+        let image =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, bw, bh).expect("cairo surface");
         {
             let cr = cairo::Context::new(&image).expect("cairo context");
             cr.scale(scale, scale);
             let content = self.content.as_ref().expect("content");
-            paint(&cr, &self.theme, &self.font, content, (w as f64, h as f64), &icons, scale);
+            paint(
+                &cr,
+                &self.theme,
+                &self.font,
+                content,
+                (w as f64, h as f64),
+                &icons,
+                scale,
+            );
         }
         image.flush();
         let src_stride = image.stride() as usize;
@@ -274,9 +322,14 @@ impl Overlay {
 
         let pool = match &mut self.pool {
             Some(pool) => pool,
-            None => self.pool.insert(SlotPool::new((stride * bh) as usize, shm).expect("shm pool")),
+            None => self
+                .pool
+                .insert(SlotPool::new((stride * bh) as usize, shm).expect("shm pool")),
         };
-        let Ok((buffer, canvas)) = pool.create_buffer(bw, bh, stride, wl_shm::Format::Argb8888) else { return };
+        let Ok((buffer, canvas)) = pool.create_buffer(bw, bh, stride, wl_shm::Format::Argb8888)
+        else {
+            return;
+        };
         for y in 0..bh as usize {
             let (s, d) = (y * src_stride, y * stride as usize);
             canvas[d..d + stride as usize].copy_from_slice(&data[s..s + stride as usize]);
@@ -295,7 +348,10 @@ impl Overlay {
     }
 
     fn icon(&mut self, path: &Path, px: i32) -> Option<cairo::ImageSurface> {
-        self.icons.entry((path.to_path_buf(), px)).or_insert_with(|| render_icon(path, px)).clone()
+        self.icons
+            .entry((path.to_path_buf(), px))
+            .or_insert_with(|| render_icon(path, px))
+            .clone()
     }
 }
 
@@ -335,19 +391,34 @@ fn paint(
         y += SECTION_H;
         if s.rows.is_empty() {
             let l = layout(&c.empty, 13.0, false);
-            text(&l, PAD + 2.0, y + (ROW_H - l.pixel_size().1 as f64) / 2.0, t.on_surface_variant.alpha(0.7));
+            text(
+                &l,
+                PAD + 2.0,
+                y + (ROW_H - l.pixel_size().1 as f64) / 2.0,
+                t.on_surface_variant.alpha(0.7),
+            );
             y += ROW_H;
         }
         for r in &s.rows {
             let mid = y + ROW_H / 2.0;
             // Key badge: accent for pinned letters, neutral for temporary numbers.
             rounded(cr, PAD, mid - BADGE / 2.0, BADGE, BADGE, 7.0);
-            if r.temporary { t.on_surface.alpha(0.10) } else { t.primary.alpha(0.20) }.set(cr);
+            if r.temporary {
+                t.on_surface.alpha(0.10)
+            } else {
+                t.primary.alpha(0.20)
+            }
+            .set(cr);
             cr.fill().ok();
             let key = r.key.to_ascii_uppercase().to_string();
             let l = layout(&key, 13.0, true);
             let (kw, kh) = l.pixel_size();
-            text(&l, PAD + (BADGE - kw as f64) / 2.0, mid - kh as f64 / 2.0, if r.temporary { t.on_surface } else { t.primary });
+            text(
+                &l,
+                PAD + (BADGE - kw as f64) / 2.0,
+                mid - kh as f64 / 2.0,
+                if r.temporary { t.on_surface } else { t.primary },
+            );
 
             let x_icon = PAD + BADGE + GAP;
             if let Some(Some(img)) = icons.get(icon_i) {
@@ -364,7 +435,11 @@ fn paint(
             l.set_width((MAX_NAME_W * pango::SCALE as f64) as i32);
             l.set_ellipsize(pango::EllipsizeMode::End);
             let nh = l.pixel_size().1 as f64;
-            let color = if r.running { t.on_surface } else { t.on_surface_variant.alpha(0.8) };
+            let color = if r.running {
+                t.on_surface
+            } else {
+                t.on_surface_variant.alpha(0.8)
+            };
             text(&l, x_icon + ICON + GAP, mid - nh / 2.0, color);
 
             if r.running {
@@ -413,7 +488,10 @@ fn render_icon(path: &Path, px: i32) -> Option<cairo::ImageSurface> {
             0,
             0,
             src.as_ref(),
-            &tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() },
+            &tiny_skia::PixmapPaint {
+                quality: tiny_skia::FilterQuality::Bicubic,
+                ..Default::default()
+            },
             tiny_skia::Transform::from_scale(s, s),
             None,
         );
@@ -421,11 +499,15 @@ fn render_icon(path: &Path, px: i32) -> Option<cairo::ImageSurface> {
         let tree = usvg::Tree::from_data(&data, &usvg::Options::default()).ok()?;
         let size = tree.size();
         let s = px as f32 / size.width().max(size.height());
-        resvg::render(&tree, tiny_skia::Transform::from_scale(s, s), &mut pixmap.as_mut());
+        resvg::render(
+            &tree,
+            tiny_skia::Transform::from_scale(s, s),
+            &mut pixmap.as_mut(),
+        );
     }
     // tiny-skia is premultiplied RGBA; cairo ARGB32 is premultiplied BGRA in memory.
     let mut bytes = pixmap.take();
-    for p in bytes.chunks_exact_mut(4) {
+    for p in bytes.as_chunks_mut::<4>().0 {
         p.swap(0, 2);
     }
     cairo::ImageSurface::create_for_data(bytes, cairo::Format::ARgb32, px, px, px * 4).ok()
@@ -446,5 +528,22 @@ impl Dispatch2<WpFractionalScaleV1, State> for Scale {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
             state.overlay.set_scale(scale, &state.shm);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hex_colors() {
+        let rgba = |c: Rgba| (c.0, c.1, c.2, c.3);
+        assert_eq!(rgba(Rgba::hex("#ff0000").unwrap()), (1.0, 0.0, 0.0, 1.0));
+        assert_eq!(
+            rgba(Rgba::hex("00ff0080").unwrap()),
+            (0.0, 1.0, 0.0, 128.0 / 255.0)
+        );
+        assert!(Rgba::hex("#fff").is_none());
+        assert!(Rgba::hex("not a color").is_none());
     }
 }

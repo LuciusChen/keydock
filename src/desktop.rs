@@ -19,22 +19,30 @@ pub struct DesktopIndex {
 
 impl DesktopIndex {
     pub fn load() -> Self {
-        let locales = locale_keys();
+        Self::from_dirs(&data_dirs(), &locale_keys())
+    }
+
+    /// Indexes `<dir>/applications` for each data dir, highest priority first.
+    fn from_dirs(dirs: &[PathBuf], locales: &[String]) -> Self {
         let mut by_key = HashMap::new();
-        // Later directories have lower priority, so only insert missing keys.
-        for dir in data_dirs() {
-            let Ok(entries) = fs::read_dir(dir.join("applications")) else { continue };
+        for dir in dirs {
+            let Ok(entries) = fs::read_dir(dir.join("applications")) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().is_none_or(|e| e != "desktop") {
                     continue;
                 }
-                let Some((entry, wm_class)) = parse_entry(&path, &locales) else { continue };
+                let Some((entry, wm_class)) = parse_entry(&path, locales) else {
+                    continue;
+                };
                 let mut keys = vec![entry.id.to_lowercase()];
                 if let Some(class) = wm_class {
                     keys.push(class.to_lowercase());
                 }
                 for key in keys {
+                    // Earlier directories win, so only fill in missing keys.
                     by_key.entry(key).or_insert_with(|| entry.clone());
                 }
             }
@@ -78,7 +86,9 @@ fn parse_entry(path: &Path, locales: &[String]) -> Option<(DesktopEntry, Option<
             fields.entry(k.trim()).or_insert(v.trim());
         }
     }
-    if fields.get("Type").is_some_and(|t| *t != "Application") || fields.get("Hidden") == Some(&"true") {
+    if fields.get("Type").is_some_and(|t| *t != "Application")
+        || fields.get("Hidden") == Some(&"true")
+    {
         return None;
     }
     let name = locales
@@ -87,25 +97,23 @@ fn parse_entry(path: &Path, locales: &[String]) -> Option<(DesktopEntry, Option<
         .or_else(|| fields.get("Name"))?
         .to_string();
     let id = path.file_stem()?.to_string_lossy().into_owned();
-    let icon = fields.get("Icon").filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let icon = fields
+        .get("Icon")
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let wm_class = fields.get("StartupWMClass").map(|s| s.to_string());
     Some((DesktopEntry { id, name, icon }, wm_class))
 }
 
-/// "zh_CN.UTF-8" -> ["zh_CN", "zh"].
+/// Name[...] keys to try, e.g. ["zh_CN", "zh"] for a Chinese session.
 fn locale_keys() -> Vec<String> {
-    let raw = ["LC_ALL", "LC_MESSAGES", "LANG"]
-        .iter()
-        .find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()))
-        .unwrap_or_default();
-    let base = raw.split(['.', '@']).next().unwrap_or("").to_string();
     let mut keys = Vec::new();
-    if !base.is_empty() && base != "C" && base != "POSIX" {
-        if let Some((lang, _)) = base.split_once('_') {
-            keys.push(base.clone());
-            keys.push(lang.to_string());
-        } else {
-            keys.push(base);
+    for lang in crate::i18n::languages() {
+        let base = lang.split('_').next().unwrap_or("").to_string();
+        for key in [lang, base] {
+            if !key.is_empty() && !keys.contains(&key) {
+                keys.push(key);
+            }
         }
     }
     keys
@@ -117,11 +125,19 @@ fn home() -> PathBuf {
 
 /// XDG data directories, highest priority first.
 fn data_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/share"))];
-    let system = std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
-    dirs.extend(system.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+    let mut dirs = vec![
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home().join(".local/share")),
+    ];
+    let system =
+        std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
+    dirs.extend(
+        system
+            .split(':')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from),
+    );
     dirs
 }
 
@@ -136,8 +152,17 @@ impl IconFinder {
     pub fn new() -> Self {
         let mut roots = vec![home().join(".icons")];
         roots.extend(data_dirs().into_iter().map(|d| d.join("icons")));
-        let mut finder = IconFinder { roots, themes: Vec::new(), cache: HashMap::new() };
-        let mut pending = vec![gtk_icon_theme().unwrap_or_else(|| "hicolor".into())];
+        Self::with(roots, &gtk_icon_theme().unwrap_or_else(|| "hicolor".into()))
+    }
+
+    /// Uses `theme`, the themes it inherits, and hicolor, found under `roots`.
+    fn with(roots: Vec<PathBuf>, theme: &str) -> Self {
+        let mut finder = IconFinder {
+            roots,
+            themes: Vec::new(),
+            cache: HashMap::new(),
+        };
+        let mut pending = vec![theme.to_string()];
         while let Some(theme) = pending.pop() {
             if finder.themes.contains(&theme) {
                 continue;
@@ -157,7 +182,11 @@ impl IconFinder {
             if let Ok(text) = fs::read_to_string(root.join(theme).join("index.theme")) {
                 for line in text.lines() {
                     if let Some(v) = line.strip_prefix("Inherits=") {
-                        return v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                        return v
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
                     }
                 }
                 return Vec::new();
@@ -215,11 +244,17 @@ fn icon_dirs(base: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<(u32, PathBuf)> = Vec::new();
     // Both "48x48/apps" (Papirus, hicolor) and "apps/48" (Breeze) layouts exist.
     for (parent, child_is_size) in [(base.to_path_buf(), true), (base.join("apps"), false)] {
-        let Ok(entries) = fs::read_dir(&parent) else { continue };
+        let Ok(entries) = fs::read_dir(&parent) else {
+            continue;
+        };
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(r) = rank(&name) else { continue };
-            let dir = if child_is_size { e.path().join("apps") } else { e.path() };
+            let dir = if child_is_size {
+                e.path().join("apps")
+            } else {
+                e.path()
+            };
             if dir.is_dir() {
                 dirs.push((r, dir));
             }
@@ -230,17 +265,105 @@ fn icon_dirs(base: &Path) -> Vec<PathBuf> {
 }
 
 fn gtk_icon_theme() -> Option<String> {
-    let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".config"));
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".config"));
     for file in ["gtk-4.0/settings.ini", "gtk-3.0/settings.ini"] {
         if let Ok(text) = fs::read_to_string(base.join(file)) {
             for line in text.lines() {
-                if let Some((k, v)) = line.split_once('=') {
-                    if k.trim() == "gtk-icon-theme-name" {
-                        return Some(v.trim().trim_matches('"').to_string());
-                    }
+                if let Some((k, v)) = line.split_once('=')
+                    && k.trim() == "gtk-icon-theme-name"
+                {
+                    return Some(v.trim().trim_matches('"').to_string());
                 }
             }
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("keydock-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(path: PathBuf, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn finds_entries_by_id_class_and_versioned_id() {
+        let (user, system) = (temp_dir("apps-user"), temp_dir("apps-system"));
+        write(
+            system.join("applications/qq.desktop"),
+            "[Desktop Entry]\nType=Application\nName=QQ\nName[zh_CN]=腾讯QQ\nIcon=qq\nStartupWMClass=QQ\n",
+        );
+        write(
+            system.join("applications/emacs.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Emacs\n",
+        );
+        write(
+            user.join("applications/emacs.desktop"),
+            "[Desktop Entry]\nType=Application\nName=My Emacs\n",
+        );
+        write(
+            system.join("applications/hidden.desktop"),
+            "[Desktop Entry]\nName=Gone\nHidden=true\n",
+        );
+        let index = DesktopIndex::from_dirs(
+            &[user.clone(), system.clone()],
+            &["zh_CN".into(), "zh".into()],
+        );
+        fs::remove_dir_all(user).unwrap();
+        fs::remove_dir_all(system).unwrap();
+
+        let qq = index.lookup("QQ").unwrap();
+        assert_eq!(
+            (qq.id.as_str(), qq.name.as_str(), qq.icon.as_deref()),
+            ("qq", "腾讯QQ", Some("qq"))
+        );
+        assert_eq!(index.lookup("emacs-32-0-50").unwrap().name, "My Emacs");
+        assert!(index.lookup("hidden").is_none());
+    }
+
+    #[test]
+    fn prefers_scalable_then_large_icons_and_follows_inheritance() {
+        let root = temp_dir("icons");
+        write(
+            root.join("Child/index.theme"),
+            "[Icon Theme]\nInherits=Parent\n",
+        );
+        write(root.join("Child/16x16/apps/term.png"), "");
+        write(root.join("Child/256x256/apps/term.png"), "");
+        write(root.join("Child/64x64/apps/term.png"), "");
+        write(root.join("Parent/scalable/apps/web.svg"), "");
+        write(root.join("hicolor/512x512/apps/chat.png"), "");
+        let mut finder = IconFinder::with(vec![root.clone()], "Child");
+        let found = |f: &mut IconFinder, name| {
+            f.find(name)
+                .map(|p| p.strip_prefix(&root).unwrap().to_path_buf())
+        };
+
+        assert_eq!(
+            found(&mut finder, "term"),
+            Some("Child/64x64/apps/term.png".into())
+        );
+        assert_eq!(
+            found(&mut finder, "web"),
+            Some("Parent/scalable/apps/web.svg".into())
+        );
+        assert_eq!(
+            found(&mut finder, "chat"),
+            Some("hicolor/512x512/apps/chat.png".into())
+        );
+        assert_eq!(found(&mut finder, "missing"), None);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

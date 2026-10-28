@@ -44,8 +44,8 @@ app_id = "kitty"       # as shown by `keydock status`; "emacs" also matches "ema
 exec = "kitty"         # launch command when no window exists
 ```
 
-Overlay colors are read from `~/.config/keydock/colors.toml` each time the overlay opens;
-without it a dark default palette is used:
+Overlay colors are read from `~/.config/keydock/colors.toml` each time the overlay opens.
+Without the file a built-in dark palette is used. Any of these keys can be set:
 
 ```toml
 surface = "#282828"
@@ -111,7 +111,25 @@ Mod+Slash { spawn "keydock" "overlay"; }
 cargo build --release && install -Dm755 target/release/keydock ~/.local/bin/keydock
 ```
 
-Needs cairo, pango and libxkbcommon at runtime.
+Needs Rust 1.88 or newer, and cairo, pango and libxkbcommon.
+
+## Development
+
+```sh
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+```
+
+CI runs the same checks. The code is split so the decisions can be tested without a compositor:
+
+| File | Role |
+|---|---|
+| `src/tracker.rs` | Window list in most-recently-used order and the show/hide decisions, returned as actions. No Wayland types; most tests live here. |
+| `src/windows.rs` | Feeds foreign-toplevel events into the tracker and sends its actions to the compositor. |
+| `src/config.rs` | Loading, validating and appending to `config.toml`. |
+| `src/overlay.rs` | The layer-shell overlay, drawn with cairo and pango. |
+| `src/desktop.rs` | Desktop entries and icon-theme lookup. |
+| `src/i18n.rs` | Session language and overlay text. |
+| `src/main.rs` | Command line, the daemon's socket and event loop, and wiring. |
 
 ## License
 

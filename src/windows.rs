@@ -1,80 +1,48 @@
-//! Window tracking through wlr-foreign-toplevel-management, plus the
-//! show/hide logic that keeps per-app window order stable.
-//!
-//! keydock keeps its own most-recently-used list instead of relying on the
-//! compositor's stacking order, so the behaviour does not depend on
-//! compositor internals.
+//! The Wayland side of window management: feeds foreign-toplevel events into
+//! the [`Tracker`] and carries out the [`Action`]s it decides on.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
-use std::time::Instant;
-
-use wayland_client::protocol::wl_seat::WlSeat;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::Instant;
 
 use smithay_client_toolkit::dispatch2::Dispatch2;
 use wayland_client::backend::ObjectData;
+use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::{Connection, Proxy, QueueHandle};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
-    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1, zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+    zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
 };
 use wayland_protocols_wlr::foreign_toplevel::v1::client::{
     zwlr_foreign_toplevel_handle_v1::{self as handle, ZwlrForeignToplevelHandleV1},
     zwlr_foreign_toplevel_manager_v1::{self as manager, ZwlrForeignToplevelManagerV1},
 };
+use xkbcommon::xkb;
 
 use crate::State;
-use crate::config::{Hide, app_id_matches};
-
-pub struct Window {
-    pub handle: ZwlrForeignToplevelHandleV1,
-    pub app_id: String,
-    pub title: String,
-    pub activated: bool,
-    pub minimized: bool,
-}
+use crate::tracker::{Action, Id, Tracker};
 
 pub struct Windows {
-    /// Most recently used first. Windows never activated sit at the end.
-    pub list: Vec<Window>,
-    /// Windows keydock minimized as part of hiding a whole app.
-    hidden: HashSet<u32>,
-    /// Apps launched recently, to ignore repeated presses while they start.
-    launching: Vec<(String, Instant)>,
+    pub tracker: Tracker,
+    handles: HashMap<Id, ZwlrForeignToplevelHandleV1>,
     seat: Option<WlSeat>,
     vk_manager: Option<ZwpVirtualKeyboardManagerV1>,
-    vk: Option<(ZwpVirtualKeyboardV1, xkbcommon::xkb::Keymap)>,
-    time: Instant,
-    /// Chord that makes the compositor warp the pointer to the active window
-    /// (the foreign-toplevel protocol exposes no geometry). None disables it.
-    pub warp_chord: Option<String>,
-    /// Learned on the first automatic hide: some compositors ignore minimize requests.
-    pub minimize_works: Option<bool>,
-}
-
-/// Windows whose minimize request still needs confirming (see `Hide::Auto`).
-pub struct MinimizeCheck {
-    pub app_id: String,
-    pub windows: Vec<u32>,
-}
-
-fn key_of(handle: &ZwlrForeignToplevelHandleV1) -> u32 {
-    handle.id().protocol_id()
+    vk: Option<(ZwpVirtualKeyboardV1, xkb::Keymap)>,
+    started: Instant,
 }
 
 impl Windows {
     pub fn new(vk_manager: Option<ZwpVirtualKeyboardManagerV1>) -> Self {
         Windows {
-            list: Vec::new(),
-            hidden: HashSet::new(),
-            launching: Vec::new(),
+            tracker: Tracker::default(),
+            handles: HashMap::new(),
             seat: None,
             vk_manager,
             vk: None,
-            time: Instant::now(),
-            warp_chord: None,
-            minimize_works: None,
+            started: Instant::now(),
         }
     }
 
@@ -82,204 +50,120 @@ impl Windows {
         self.seat = Some(seat);
     }
 
-    fn index(&self, h: &ZwlrForeignToplevelHandleV1) -> Option<usize> {
-        self.list.iter().position(|w| &w.handle == h)
-    }
-
-    pub fn active(&self) -> Option<&Window> {
-        self.list.iter().find(|w| w.activated)
-    }
-
-    /// Windows of an app, most recently used first.
-    pub fn of_app<'a>(&'a self, app_id: &'a str) -> impl Iterator<Item = &'a Window> + 'a {
-        self.list.iter().filter(move |w| app_id_matches(app_id, &w.app_id))
-    }
-
-    /// Focuses the app, hides it when it is already focused, or launches it.
-    /// Returns windows to re-check when minimize support is not known yet.
-    pub fn toggle(
+    /// Sends the actions to the compositor. `warp` is the chord for
+    /// [`Action::Warp`]; None skips it.
+    pub fn run(
         &mut self,
         qh: &QueueHandle<State>,
-        app_id: &str,
-        exec: Option<&str>,
-        hide: Hide,
-    ) -> Result<Option<MinimizeCheck>, String> {
-        let focused = self.active().is_some_and(|w| app_id_matches(app_id, &w.app_id));
-        if focused {
-            Ok(self.hide(qh, app_id, hide))
-        } else {
-            self.show(qh, app_id, exec).map(|_| None)
-        }
-    }
-
-    /// Brings all of an app's windows forward, most recent on top, or launches it.
-    pub fn show(&mut self, qh: &QueueHandle<State>, app_id: &str, exec: Option<&str>) -> Result<(), String> {
-        let wins: Vec<(ZwlrForeignToplevelHandleV1, bool)> =
-            self.of_app(app_id).map(|w| (w.handle.clone(), w.minimized)).collect();
-        if wins.is_empty() {
-            return self.launch(app_id, exec);
-        }
-        let Some(seat) = self.seat.clone() else { return Err("no seat".into()) };
-        // Windows the user minimized one by one stay minimized (like macOS),
-        // unless every window is minimized; then the most recent one returns.
-        let mut targets: Vec<_> = wins
-            .iter()
-            .filter(|(h, minimized)| !minimized || self.hidden.contains(&key_of(h)))
-            .cloned()
-            .collect();
-        if targets.is_empty() {
-            targets.push(wins[0].clone());
-        }
-        // Activate least recent first so the most recent ends up on top.
-        for (h, minimized) in targets.iter().rev() {
-            if *minimized {
-                h.unset_minimized();
+        actions: &[Action],
+        warp: Option<&str>,
+    ) -> Result<(), String> {
+        for action in actions {
+            match action {
+                Action::Activate(id) => {
+                    let seat = self.seat.as_ref().ok_or("no seat")?;
+                    self.handle(*id)?.activate(seat);
+                }
+                Action::Unminimize(id) => self.handle(*id)?.unset_minimized(),
+                Action::Minimize(id) => self.handle(*id)?.set_minimized(),
+                Action::Launch(exec) => launch(exec)?,
+                Action::Warp => {
+                    if let Some(chord) = warp {
+                        self.send_chord(qh, chord)?;
+                    }
+                }
             }
-            h.activate(&seat);
-            self.hidden.remove(&key_of(h));
         }
-        self.warp_pointer(qh);
         Ok(())
     }
 
-    /// Hides the app: minimizes its windows, or focuses the previous app
-    /// where minimizing is unsupported or not wanted.
-    pub fn hide(&mut self, qh: &QueueHandle<State>, app_id: &str, mode: Hide) -> Option<MinimizeCheck> {
-        let minimize = match mode {
-            Hide::Minimize => true,
-            Hide::Previous => false,
-            Hide::Auto => self.minimize_works != Some(false),
-        };
-        if !minimize {
-            self.focus_previous(qh, app_id);
-            return None;
-        }
-        let keys = self.minimize_all(app_id);
-        (mode == Hide::Auto && self.minimize_works.is_none() && !keys.is_empty())
-            .then(|| MinimizeCheck { app_id: app_id.to_string(), windows: keys })
+    fn handle(&self, id: Id) -> Result<&ZwlrForeignToplevelHandleV1, String> {
+        self.handles
+            .get(&id)
+            .ok_or_else(|| format!("window {id} is gone"))
     }
 
-    /// Minimizes every window of the app, the focused one last so focus
-    /// moves to another app instead of a sibling window.
-    fn minimize_all(&mut self, app_id: &str) -> Vec<u32> {
-        let mut wins: Vec<(ZwlrForeignToplevelHandleV1, bool)> = self
-            .of_app(app_id)
-            .filter(|w| !w.minimized)
-            .map(|w| (w.handle.clone(), w.activated))
-            .collect();
-        wins.sort_by_key(|(_, active)| *active);
-        let mut keys = Vec::new();
-        for (h, _) in wins {
-            h.set_minimized();
-            self.hidden.insert(key_of(&h));
-            keys.push(key_of(&h));
-        }
-        keys
-    }
-
-    /// Called shortly after an automatic hide: if none of the windows became
-    /// minimized, the compositor ignores minimize requests, so remember that
-    /// and fall back to focusing the previous app.
-    pub fn check_minimized(&mut self, qh: &QueueHandle<State>, check: MinimizeCheck) {
-        if self.minimize_works.is_some() {
-            return;
-        }
-        let tracked: Vec<&Window> = self.list.iter().filter(|w| check.windows.contains(&key_of(&w.handle))).collect();
-        if tracked.is_empty() {
-            return; // windows closed meanwhile; decide next time
-        }
-        if tracked.iter().any(|w| w.minimized) {
-            self.minimize_works = Some(true);
-        } else {
-            self.minimize_works = Some(false);
-            for k in &check.windows {
-                self.hidden.remove(k);
-            }
-            self.focus_previous(qh, &check.app_id);
-        }
-    }
-
-    /// Focuses the most recently used visible window of any other app.
-    fn focus_previous(&mut self, qh: &QueueHandle<State>, app_id: &str) {
-        let Some(seat) = self.seat.clone() else { return };
-        let target = self
-            .list
-            .iter()
-            .find(|w| !w.minimized && !w.app_id.is_empty() && !app_id_matches(app_id, &w.app_id))
-            .map(|w| w.handle.clone());
-        if let Some(h) = target {
-            h.activate(&seat);
-            self.warp_pointer(qh);
-        }
-    }
-
-    fn launch(&mut self, app_id: &str, exec: Option<&str>) -> Result<(), String> {
-        let Some(exec) = exec else { return Err(format!("{app_id} is not running and has no exec")) };
-        self.launching.retain(|(_, t)| t.elapsed().as_secs() < 5);
-        if self.launching.iter().any(|(a, _)| a == app_id) {
-            return Ok(());
-        }
-        // setsid -f detaches immediately, so no zombie is left behind.
-        std::process::Command::new("setsid")
-            .args(["-f", "sh", "-c", exec])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| format!("launch {exec}: {e}"))?;
-        self.launching.push((app_id.to_string(), Instant::now()));
-        Ok(())
-    }
-
-    /// Sends the warp chord on the same connection right after the activate
-    /// requests, so the compositor handles it after focus has moved.
-    fn warp_pointer(&mut self, qh: &QueueHandle<State>) {
-        let Some(chord) = self.warp_chord.clone() else { return };
-        let Some((vk, keymap)) = self.virtual_keyboard(qh) else { return };
-        let Some((code, mods)) = parse_chord(keymap, &chord) else {
-            eprintln!("keydock: cannot parse warp chord {chord:?}");
-            return;
-        };
-        let vk = vk.clone();
-        let t = self.time.elapsed().as_millis() as u32;
+    /// Types the chord on a virtual keyboard. The foreign-toplevel protocol
+    /// has no window geometry, so the compositor binds this chord to its own
+    /// "warp pointer to the focused window" action. Being on the same
+    /// connection, it arrives after the activate requests.
+    fn send_chord(&mut self, qh: &QueueHandle<State>, chord: &str) -> Result<(), String> {
+        let time = self.started.elapsed().as_millis() as u32;
+        let (vk, keymap) = self
+            .virtual_keyboard(qh)
+            .ok_or("no virtual keyboard support")?;
+        let (code, mods) = parse_chord(keymap, chord)
+            .ok_or_else(|| format!("cannot parse warp chord {chord:?}"))?;
         vk.modifiers(mods, 0, 0, 0);
-        vk.key(t, code, 1);
-        vk.key(t + 1, code, 0);
+        vk.key(time, code, 1);
+        vk.key(time, code, 0);
         vk.modifiers(0, 0, 0, 0);
+        Ok(())
     }
 
-    fn virtual_keyboard(&mut self, qh: &QueueHandle<State>) -> Option<&(ZwpVirtualKeyboardV1, xkbcommon::xkb::Keymap)> {
+    fn virtual_keyboard(
+        &mut self,
+        qh: &QueueHandle<State>,
+    ) -> Option<&(ZwpVirtualKeyboardV1, xkb::Keymap)> {
         if self.vk.is_none() {
             let (manager, seat) = (self.vk_manager.as_ref()?, self.seat.as_ref()?);
-            let (keymap, fd, size) = us_keymap()?;
+            let keymap = us_keymap()?;
+            let (fd, size) = keymap_fd(&keymap)?;
             let vk = manager.create_virtual_keyboard(seat, qh, crate::Noop);
-            vk.keymap(1, fd.as_fd(), size);
+            vk.keymap(xkb::KEYMAP_FORMAT_TEXT_V1, fd.as_fd(), size);
             self.vk = Some((vk, keymap));
         }
         self.vk.as_ref()
     }
 }
 
-/// Parses "super+ctrl+alt+shift+p" into an evdev key code and a modifier mask.
-fn parse_chord(keymap: &xkbcommon::xkb::Keymap, chord: &str) -> Option<(u32, u32)> {
-    use xkbcommon::xkb;
+/// Starts a shell command fully detached, so no zombie is left behind.
+fn launch(exec: &str) -> Result<(), String> {
+    Command::new("setsid")
+        .args(["-f", "sh", "-c", exec])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|_| ())
+        .map_err(|e| format!("launch {exec}: {e}"))
+}
+
+fn us_keymap() -> Option<xkb::Keymap> {
+    let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    xkb::Keymap::new_from_names(&ctx, "", "", "us", "", None, xkb::KEYMAP_COMPILE_NO_FLAGS)
+}
+
+/// The keymap as a NUL-terminated string in a memfd, as wl_keyboard expects.
+fn keymap_fd(keymap: &xkb::Keymap) -> Option<(OwnedFd, u32)> {
+    let mut text = keymap
+        .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+        .into_bytes();
+    text.push(0);
+    // SAFETY: memfd_create returns a new descriptor that nothing else owns.
+    let fd = unsafe { libc::memfd_create(c"keydock-keymap".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.write_all(&text).ok()?;
+    Some((file.into(), text.len() as u32))
+}
+
+/// Parses a chord like "super+ctrl+alt+shift+p" into an evdev key code and a
+/// modifier mask for `keymap`.
+fn parse_chord(keymap: &xkb::Keymap, chord: &str) -> Option<(u32, u32)> {
     let (mut mask, mut key) = (0u32, None);
     for part in chord.split('+').map(str::trim).filter(|p| !p.is_empty()) {
         let modifier = match part.to_lowercase().as_str() {
-            "super" | "logo" | "win" | "mod4" => Some("Mod4"),
-            "ctrl" | "control" => Some("Control"),
-            "alt" | "mod1" => Some("Mod1"),
-            "shift" => Some("Shift"),
+            "super" | "logo" | "win" | "mod4" => Some(xkb::MOD_NAME_LOGO),
+            "ctrl" | "control" => Some(xkb::MOD_NAME_CTRL),
+            "alt" | "mod1" => Some(xkb::MOD_NAME_ALT),
+            "shift" => Some(xkb::MOD_NAME_SHIFT),
             _ => None,
         };
         match modifier {
-            Some(name) => {
-                let i = keymap.mod_get_index(name);
-                if i == xkb::MOD_INVALID {
-                    return None;
-                }
-                mask |= 1 << i;
-            }
+            Some(name) => mask |= 1 << keymap.mod_get_index(name),
             None if key.is_none() => key = Some(part),
             None => return None,
         }
@@ -288,27 +172,18 @@ fn parse_chord(keymap: &xkbcommon::xkb::Keymap, chord: &str) -> Option<(u32, u32
     if sym.raw() == 0 {
         return None;
     }
-    // Find the key that produces the symbol without modifiers; evdev = xkb - 8.
-    let (min, max) = (keymap.min_keycode().raw(), keymap.max_keycode().raw());
-    (min..=max)
-        .find(|&kc| keymap.key_get_syms_by_level(xkb::Keycode::new(kc), 0, 0).contains(&sym))
-        .map(|kc| (kc - 8, mask))
+    // The key producing the symbol at the base level; evdev codes are xkb codes - 8.
+    (keymap.min_keycode().raw()..=keymap.max_keycode().raw())
+        .find(|&code| {
+            keymap
+                .key_get_syms_by_level(code.into(), 0, 0)
+                .contains(&sym)
+        })
+        .map(|code| (code - 8, mask))
 }
 
-/// A US keymap, serialized into a memfd for the virtual keyboard.
-fn us_keymap() -> Option<(xkbcommon::xkb::Keymap, OwnedFd, u32)> {
-    use xkbcommon::xkb;
-    let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-    let keymap = xkb::Keymap::new_from_names(&ctx, "", "", "us", "", None, xkb::KEYMAP_COMPILE_NO_FLAGS)?;
-    let mut text = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1).into_bytes();
-    text.push(0);
-    let fd = unsafe { libc::memfd_create(c"keydock-keymap".as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return None;
-    }
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    file.write_all(&text).ok()?;
-    Some((keymap, file.into(), text.len() as u32))
+fn id_of(handle: &ZwlrForeignToplevelHandleV1) -> Id {
+    handle.id().protocol_id()
 }
 
 /// User data for the foreign-toplevel manager.
@@ -326,13 +201,9 @@ impl Dispatch2<ZwlrForeignToplevelManagerV1, State> for ToplevelManager {
         _: &QueueHandle<State>,
     ) {
         if let manager::Event::Toplevel { toplevel } = event {
-            state.windows.list.push(Window {
-                handle: toplevel,
-                app_id: String::new(),
-                title: String::new(),
-                activated: false,
-                minimized: false,
-            });
+            let id = id_of(&toplevel);
+            state.windows.tracker.add(id);
+            state.windows.handles.insert(id, toplevel);
         }
     }
 
@@ -346,41 +217,59 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for Toplevel {
     fn event(
         &self,
         state: &mut State,
-        h: &ZwlrForeignToplevelHandleV1,
+        handle: &ZwlrForeignToplevelHandleV1,
         event: handle::Event,
         _: &Connection,
         _: &QueueHandle<State>,
     ) {
-        let ws = &mut state.windows;
-        let Some(i) = ws.index(h) else { return };
+        let (id, windows) = (id_of(handle), &mut state.windows);
         match event {
-            handle::Event::Title { title } => ws.list[i].title = title,
-            handle::Event::AppId { app_id } => {
-                ws.launching.retain(|(a, _)| !app_id_matches(a, &app_id));
-                ws.list[i].app_id = app_id;
-            }
+            handle::Event::Title { title } => windows.tracker.set_title(id, title),
+            handle::Event::AppId { app_id } => windows.tracker.set_app_id(id, app_id),
             handle::Event::State { state: raw } => {
-                let states: Vec<u32> =
-                    raw.chunks_exact(4).map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect();
-                let activated = states.contains(&(handle::State::Activated as u32));
-                let minimized = states.contains(&(handle::State::Minimized as u32));
-                let was_activated = ws.list[i].activated;
-                ws.list[i].activated = activated;
-                ws.list[i].minimized = minimized;
-                if !minimized {
-                    ws.hidden.remove(&key_of(h));
-                }
-                if activated && !was_activated {
-                    let w = ws.list.remove(i);
-                    ws.list.insert(0, w);
-                }
+                let has =
+                    |s: handle::State| raw.as_chunks::<4>().0.contains(&(s as u32).to_ne_bytes());
+                windows.tracker.set_state(
+                    id,
+                    has(handle::State::Activated),
+                    has(handle::State::Minimized),
+                );
             }
             handle::Event::Closed => {
-                ws.hidden.remove(&key_of(h));
-                ws.list.remove(i);
-                h.destroy();
+                windows.tracker.remove(id);
+                windows.handles.remove(&id);
+                handle.destroy();
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_chords() {
+        let keymap = us_keymap().unwrap();
+        let bit = |name| 1 << keymap.mod_get_index(name);
+        let all = bit(xkb::MOD_NAME_LOGO)
+            | bit(xkb::MOD_NAME_CTRL)
+            | bit(xkb::MOD_NAME_ALT)
+            | bit(xkb::MOD_NAME_SHIFT);
+
+        const KEY_P: u32 = 25;
+        const KEY_F12: u32 = 88;
+        assert_eq!(
+            parse_chord(&keymap, "super+ctrl+alt+shift+p"),
+            Some((KEY_P, all))
+        );
+        assert_eq!(
+            parse_chord(&keymap, "Alt + Super + F12"),
+            Some((KEY_F12, bit(xkb::MOD_NAME_ALT) | bit(xkb::MOD_NAME_LOGO)))
+        );
+        assert_eq!(parse_chord(&keymap, "super+p+q"), None);
+        assert_eq!(parse_chord(&keymap, "super+nosuchkey"), None);
+        assert_eq!(parse_chord(&keymap, "super"), None);
     }
 }

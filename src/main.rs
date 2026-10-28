@@ -7,9 +7,10 @@ mod config;
 mod desktop;
 mod i18n;
 mod overlay;
+mod tracker;
 mod windows;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -39,13 +40,12 @@ use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_seat, wl_surface},
 };
-use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
-use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
 
 use config::Config;
 use desktop::{DesktopIndex, IconFinder};
 use overlay::{Content, Mode, Overlay, Row, Section};
+use tracker::MinimizeCheck;
 use windows::Windows;
 
 const USAGE: &str = "usage: keydock <command>
@@ -58,7 +58,9 @@ const USAGE: &str = "usage: keydock <command>
   reload        re-read desktop entries and icons";
 
 fn socket_path() -> PathBuf {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     dir.join("keydock.sock")
 }
 
@@ -87,7 +89,11 @@ fn client(line: &str) -> i32 {
     let mut stream = UnixStream::connect(&path);
     if stream.is_err() {
         let exe = std::env::current_exe().unwrap_or_else(|_| "keydock".into());
-        let _ = std::process::Command::new("setsid").arg("-f").arg(exe).arg("daemon").status();
+        let _ = std::process::Command::new("setsid")
+            .arg("-f")
+            .arg(exe)
+            .arg("daemon")
+            .status();
         let start = Instant::now();
         while stream.is_err() && start.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(20));
@@ -101,8 +107,9 @@ fn client(line: &str) -> i32 {
     if writeln!(stream, "{line}").is_err() {
         return 1;
     }
-    let mut reply = String::new();
-    let _ = BufReader::new(stream).read_to_string_lossy(&mut reply);
+    let mut reply = Vec::new();
+    let _ = stream.read_to_end(&mut reply);
+    let reply = String::from_utf8_lossy(&reply);
     let reply = reply.trim_end();
     match reply.strip_prefix("error: ") {
         Some(err) => {
@@ -118,16 +125,28 @@ fn client(line: &str) -> i32 {
     }
 }
 
-trait ReadLossy {
-    fn read_to_string_lossy(&mut self, out: &mut String) -> std::io::Result<()>;
+/// Commands the daemon accepts, one per connection.
+#[derive(Debug, PartialEq, Eq)]
+enum Request {
+    Key(char),
+    Overlay,
+    Status,
+    Reload,
 }
 
-impl<R: BufRead> ReadLossy for R {
-    fn read_to_string_lossy(&mut self, out: &mut String) -> std::io::Result<()> {
-        let mut buf = Vec::new();
-        self.read_to_end(&mut buf)?;
-        out.push_str(&String::from_utf8_lossy(&buf));
-        Ok(())
+impl Request {
+    fn parse(line: &str) -> Result<Request, String> {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            ["key", k] => match k.chars().collect::<Vec<_>>().as_slice() {
+                [c] if c.is_ascii_alphabetic() => Ok(Request::Key(c.to_ascii_lowercase())),
+                _ => Err(format!("not a letter: {k}")),
+            },
+            ["overlay"] => Ok(Request::Overlay),
+            ["status"] => Ok(Request::Status),
+            ["reload"] => Ok(Request::Reload),
+            _ => Err(format!("unknown command: {line}\n{USAGE}")),
+        }
     }
 }
 
@@ -135,11 +154,7 @@ pub struct State {
     registry: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
-    compositor: CompositorState,
-    layer_shell: LayerShell,
     pub shm: Shm,
-    fractional: Option<WpFractionalScaleManagerV1>,
-    viewporter: Option<WpViewporter>,
     qh: QueueHandle<State>,
     conn: Connection,
     event_loop: LoopHandle<'static, State>,
@@ -158,16 +173,22 @@ fn daemon() -> Result<(), String> {
         return Err("already running".into());
     }
     let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).map_err(|e| format!("bind {}: {e}", path.display()))?;
+    let listener =
+        UnixListener::bind(&path).map_err(|e| format!("bind {}: {e}", path.display()))?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
 
     let conn = Connection::connect_to_env().map_err(|e| format!("wayland: {e}"))?;
-    let (globals, queue) = registry_queue_init::<State>(&conn).map_err(|e| format!("wayland: {e}"))?;
+    let (globals, queue) =
+        registry_queue_init::<State>(&conn).map_err(|e| format!("wayland: {e}"))?;
     let qh = queue.handle();
     let missing = |what: &str| format!("compositor does not support {what}");
 
-    let compositor = CompositorState::bind(&globals, &qh).map_err(|_| missing("wl_compositor"))?;
-    let layer_shell = LayerShell::bind(&globals, &qh).map_err(|_| missing("wlr-layer-shell"))?;
+    let overlay_globals = overlay::Globals {
+        compositor: CompositorState::bind(&globals, &qh).map_err(|_| missing("wl_compositor"))?,
+        layer_shell: LayerShell::bind(&globals, &qh).map_err(|_| missing("wlr-layer-shell"))?,
+        fractional: globals.bind(&qh, 1..=1, Noop).ok(),
+        viewporter: globals.bind(&qh, 1..=1, Noop).ok(),
+    };
     let shm = Shm::bind(&globals, &qh).map_err(|_| missing("wl_shm"))?;
     let _toplevels: ZwlrForeignToplevelManagerV1 = globals
         .bind(&qh, 1..=3, windows::ToplevelManager)
@@ -179,40 +200,45 @@ fn daemon() -> Result<(), String> {
         registry: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
-        compositor,
-        layer_shell,
         shm,
-        fractional: globals.bind(&qh, 1..=1, Noop).ok(),
-        viewporter: globals.bind(&qh, 1..=1, Noop).ok(),
         qh: qh.clone(),
         conn: conn.clone(),
         event_loop: event_loop.handle(),
         windows: Windows::new(vk_manager),
-        overlay: Overlay::new(),
+        overlay: Overlay::new(overlay_globals),
         overlay_targets: Vec::new(),
         desktop: DesktopIndex::load(),
         desktop_loaded: Instant::now(),
         icons: IconFinder::new(),
     };
 
-    WaylandSource::new(conn, queue).insert(event_loop.handle()).map_err(|e| e.to_string())?;
+    WaylandSource::new(conn, queue)
+        .insert(event_loop.handle())
+        .map_err(|e| e.to_string())?;
     event_loop
         .handle()
-        .insert_source(Generic::new(listener, Interest::READ, IoMode::Level), |_, listener, state| {
-            while let Ok((stream, _)) = listener.accept() {
-                state.serve(stream);
-            }
-            Ok(PostAction::Continue)
-        })
+        .insert_source(
+            Generic::new(listener, Interest::READ, IoMode::Level),
+            |_, listener, state| {
+                while let Ok((stream, _)) = listener.accept() {
+                    state.serve(stream);
+                }
+                Ok(PostAction::Continue)
+            },
+        )
         .map_err(|e| e.to_string())?;
 
     // Pick up existing seats and windows before serving commands.
-    event_loop.dispatch(Duration::from_millis(100), &mut state).map_err(|e| e.to_string())?;
+    event_loop
+        .dispatch(Duration::from_millis(100), &mut state)
+        .map_err(|e| e.to_string())?;
     if let Some(seat) = state.seat_state.seats().next() {
         state.windows.set_seat(seat);
     }
     loop {
-        event_loop.dispatch(None, &mut state).map_err(|e| e.to_string())?;
+        event_loop
+            .dispatch(None, &mut state)
+            .map_err(|e| e.to_string())?;
     }
 }
 
@@ -234,62 +260,56 @@ impl State {
     }
 
     fn command(&mut self, line: &str) -> Result<String, String> {
-        let mut parts = line.split_whitespace();
-        match (parts.next(), parts.next()) {
-            (Some("key"), Some(k)) => {
-                let mut chars = k.chars();
-                match (chars.next(), chars.next()) {
-                    (Some(c), None) if c.is_ascii_alphabetic() => self.key(c.to_ascii_lowercase()).map(|_| String::new()),
-                    _ => Err(format!("not a letter: {k}")),
-                }
-            }
-            (Some("overlay"), None) => {
-                if self.overlay.is_open() {
-                    self.overlay.close();
-                } else {
-                    self.open_overlay(Mode::Browse)?;
-                }
-                Ok(String::new())
-            }
-            (Some("status"), None) => Ok(self.status()),
-            (Some("reload"), None) => {
-                self.reload_desktop();
-                Ok(String::new())
-            }
-            _ => Err(format!("unknown command: {line}\n{USAGE}")),
+        match Request::parse(line)? {
+            Request::Key(key) => self.key(key)?,
+            Request::Overlay if self.overlay.is_open() => self.overlay.close(),
+            Request::Overlay => self.open_overlay(Mode::Browse)?,
+            Request::Status => return Ok(self.status()),
+            Request::Reload => self.reload_desktop(),
         }
+        Ok(String::new())
     }
 
     fn key(&mut self, key: char) -> Result<(), String> {
-        let cfg = load_config()?;
-        if self.overlay.is_open() {
-            self.overlay.close();
-        }
-        self.windows.warp_chord = cfg.warp().map(str::to_string);
-        let Some(app) = cfg.by_key(&key.to_string()) else { return self.open_overlay(Mode::Assign(key)) };
-        if let Some(check) = self.windows.toggle(&self.qh, &app.app_id, app.exec.as_deref(), cfg.hide)? {
-            // Give the compositor time to report the minimized state.
-            let timer = Timer::from_duration(Duration::from_millis(150));
-            let mut check = Some(check);
-            let _ = self.event_loop.insert_source(timer, move |_, _, state| {
-                if let Some(check) = check.take() {
-                    state.windows.check_minimized(&state.qh, check);
-                    let _ = state.conn.flush();
-                }
-                TimeoutAction::Drop
-            });
+        let cfg = Config::load()?;
+        self.overlay.close();
+        let Some(app) = cfg.by_key(key) else {
+            return self.open_overlay(Mode::Assign(key));
+        };
+        let (actions, check) =
+            self.windows
+                .tracker
+                .toggle(&app.app_id, app.exec.as_deref(), cfg.hide)?;
+        self.windows.run(&self.qh, &actions, cfg.warp())?;
+        if let Some(check) = check {
+            self.verify_minimize(check, cfg.warp().map(str::to_string));
         }
         Ok(())
     }
 
+    /// Gives the compositor time to report the minimized state, then lets the
+    /// tracker fall back to focusing the previous app if it did not.
+    fn verify_minimize(&mut self, check: MinimizeCheck, warp: Option<String>) {
+        let timer = Timer::from_duration(Duration::from_millis(150));
+        let _ = self.event_loop.insert_source(timer, move |_, _, state| {
+            let actions = state.windows.tracker.check_minimized(&check);
+            if let Err(e) = state.windows.run(&state.qh, &actions, warp.as_deref()) {
+                eprintln!("keydock: {e}");
+            }
+            let _ = state.conn.flush();
+            TimeoutAction::Drop
+        });
+    }
+
     fn status(&self) -> String {
-        let minimize = match self.windows.minimize_works {
+        let minimize = match self.windows.tracker.minimize_works {
             Some(true) => "supported",
             Some(false) => "ignored by compositor, hiding focuses the previous app",
             None => "not tested yet",
         };
         let windows = self
             .windows
+            .tracker
             .list
             .iter()
             .map(|w| {
@@ -314,8 +334,9 @@ impl State {
     /// Open apps without a pinned letter, most recently used first.
     fn unpinned(&self, cfg: &Config) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for w in &self.windows.list {
-            if w.app_id.is_empty() || cfg.by_app_id(&w.app_id).is_some() || out.contains(&w.app_id) {
+        for w in &self.windows.tracker.list {
+            if w.app_id.is_empty() || cfg.by_app_id(&w.app_id).is_some() || out.contains(&w.app_id)
+            {
                 continue;
             }
             out.push(w.app_id.clone());
@@ -326,14 +347,26 @@ impl State {
 
     fn row(&mut self, key: char, app_id: &str, name: Option<&str>, temporary: bool) -> Row {
         let entry = self.desktop.lookup(app_id).cloned();
-        let icon = entry.as_ref().and_then(|e| e.icon.as_deref()).and_then(|i| self.icons.find(i));
-        let name = name.map(str::to_string).or(entry.map(|e| e.name)).unwrap_or_else(|| app_id.to_string());
-        let running = self.windows.of_app(app_id).next().is_some();
-        Row { key, name, icon, running, temporary }
+        let icon = entry
+            .as_ref()
+            .and_then(|e| e.icon.as_deref())
+            .and_then(|i| self.icons.find(i));
+        let name = name
+            .map(str::to_string)
+            .or(entry.map(|e| e.name))
+            .unwrap_or_else(|| app_id.to_string());
+        let running = self.windows.tracker.of_app(app_id).next().is_some();
+        Row {
+            key,
+            name,
+            icon,
+            running,
+            temporary,
+        }
     }
 
     fn open_overlay(&mut self, mode: Mode) -> Result<(), String> {
-        let cfg = load_config()?;
+        let cfg = Config::load()?;
         if self.desktop_loaded.elapsed() > Duration::from_secs(60) {
             self.reload_desktop();
         }
@@ -343,101 +376,127 @@ impl State {
             .enumerate()
             .map(|(i, id)| self.row(char::from(b'1' + i as u8), id, None, true))
             .collect();
-        let text = i18n::current();
+        let text = i18n::strings(&i18n::languages());
         let content = match mode {
             Mode::Browse => {
                 let pinned: Vec<Row> = cfg
                     .apps
                     .iter()
-                    .filter_map(|a| a.key.chars().next().map(|k| (k, a)))
-                    .map(|(k, a)| self.row(k, &a.app_id, a.name.as_deref(), false))
+                    .map(|a| self.row(a.key, &a.app_id, a.name.as_deref(), false))
                     .collect();
                 Content {
                     title: None,
                     sections: vec![
-                        Section { title: text.pinned.into(), rows: pinned },
-                        Section { title: text.open.into(), rows: numbered },
+                        Section {
+                            title: text.pinned.into(),
+                            rows: pinned,
+                        },
+                        Section {
+                            title: text.open.into(),
+                            rows: numbered,
+                        },
                     ],
                     hint: text.browse_hint.into(),
                     empty: text.none.into(),
                 }
             }
             Mode::Assign(k) => Content {
-                title: Some(
-                    text.unassigned.replace("{key}", &format!("{}+{}", cfg.key_label(), k.to_ascii_uppercase())),
-                ),
-                sections: vec![Section { title: text.assign_section.into(), rows: numbered }],
+                title: Some(text.unassigned.replace(
+                    "{key}",
+                    &format!("{}+{}", cfg.key_label(), k.to_ascii_uppercase()),
+                )),
+                sections: vec![Section {
+                    title: text.assign_section.into(),
+                    rows: numbered,
+                }],
                 hint: text.assign_hint.into(),
                 empty: text.none.into(),
             },
         };
         self.overlay_targets = targets;
-        self.overlay.open(
-            &self.qh,
-            &self.compositor,
-            &self.layer_shell,
-            self.fractional.as_ref(),
-            self.viewporter.as_ref(),
-            mode,
-            content,
-            cfg.font.as_deref(),
-        );
+        self.overlay
+            .open(&self.qh, mode, content, cfg.font.as_deref());
         Ok(())
     }
 
+    /// A key typed into the overlay: Esc closes it, letters and numbers
+    /// switch to an app, and in assign mode a number pins that app.
     fn overlay_key(&mut self, event: &KeyEvent) {
         if event.keysym == Keysym::Escape {
             self.overlay.close();
             return;
         }
-        let Some(c) = event.utf8.as_deref().and_then(|s| s.chars().next()).map(|c| c.to_ascii_lowercase()) else {
+        let Some(c) = event.utf8.as_deref().and_then(|s| s.chars().next()) else {
             return;
         };
-        let Ok(cfg) = load_config() else { return };
-        self.windows.warp_chord = cfg.warp().map(str::to_string);
-        let target = c.to_digit(10).and_then(|d| self.overlay_targets.get((d as usize).checked_sub(1)?)).cloned();
-        let result = match (&self.overlay.mode, target) {
-            (Some(Mode::Browse), Some(app_id)) => {
-                self.overlay.close();
-                self.windows.show(&self.qh, &app_id, None)
-            }
-            (Some(Mode::Browse), None) => match cfg.by_key(&c.to_string()) {
-                Some(app) => {
-                    let (app_id, exec) = (app.app_id.clone(), app.exec.clone());
-                    self.overlay.close();
-                    self.windows.show(&self.qh, &app_id, exec.as_deref())
-                }
-                None => Ok(()),
-            },
-            (Some(Mode::Assign(key)), Some(app_id)) => {
-                let key = key.to_string();
-                let exec = self.desktop.lookup(&app_id).map(|e| format!("gtk-launch {}", e.id));
-                self.overlay.close();
-                Config::append(&key, &app_id, exec.as_deref())
-                    .map_err(|e| e.to_string())
-                    .and_then(|_| self.windows.show(&self.qh, &app_id, None))
-            }
-            _ => Ok(()),
-        };
-        if let Err(e) = result {
+        if let Err(e) = self.overlay_choice(c.to_ascii_lowercase()) {
             eprintln!("keydock: {e}");
         }
     }
-}
 
-fn load_config() -> Result<Config, String> {
-    match Config::load() {
-        (_, Some(err)) => Err(err),
-        (cfg, None) => Ok(cfg),
+    fn overlay_choice(&mut self, c: char) -> Result<(), String> {
+        let cfg = Config::load()?;
+        let numbered = c
+            .to_digit(10)
+            .and_then(|d| self.overlay_targets.get((d as usize).checked_sub(1)?))
+            .cloned();
+        let (app_id, exec) = match (&self.overlay.mode, numbered) {
+            (Some(Mode::Assign(key)), Some(app_id)) => {
+                let exec = self
+                    .desktop
+                    .lookup(&app_id)
+                    .map(|e| format!("gtk-launch {}", e.id));
+                Config::append_to(&Config::path(), *key, &app_id, exec.as_deref())
+                    .map_err(|e| e.to_string())?;
+                (app_id, None)
+            }
+            (Some(Mode::Browse), Some(app_id)) => (app_id, None),
+            (Some(Mode::Browse), None) => match cfg.by_key(c) {
+                Some(app) => (app.app_id.clone(), app.exec.clone()),
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        self.overlay.close();
+        let actions = self.windows.tracker.show(&app_id, exec.as_deref())?;
+        self.windows.run(&self.qh, &actions, cfg.warp())
     }
 }
 
 impl CompositorHandler for State {
-    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
-    fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
+    fn scale_factor_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: i32,
+    ) {
+    }
+    fn transform_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: wl_output::Transform,
+    ) {
+    }
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
-    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
-    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
+    fn surface_leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
 }
 
 impl OutputHandler for State {
@@ -453,7 +512,14 @@ impl LayerShellHandler for State {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
         self.overlay.close();
     }
-    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface, _: LayerSurfaceConfigure, _: u32) {
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &LayerSurface,
+        _: LayerSurfaceConfigure,
+        _: u32,
+    ) {
         self.overlay.configured(&self.shm);
     }
 }
@@ -465,30 +531,93 @@ impl SeatHandler for State {
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         self.windows.set_seat(seat);
     }
-    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        cap: Capability,
+    ) {
         if cap == Capability::Keyboard {
             let _ = self.seat_state.get_keyboard(qh, &seat, None);
         }
     }
-    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, _: Capability) {}
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        _: Capability,
+    ) {
+    }
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
 
 impl KeyboardHandler for State {
-    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, surface: &wl_surface::WlSurface, _: u32) {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+    }
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
         if self.overlay.owns(surface) {
             self.overlay.close();
         }
     }
-    fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
         if self.overlay.is_open() {
             self.overlay_key(&event);
         }
     }
-    fn repeat_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
-    fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
-    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: Modifiers, _: RawModifiers, _: u32) {}
+    fn repeat_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: Modifiers,
+        _: RawModifiers,
+        _: u32,
+    ) {
+    }
 }
 
 impl ShmHandler for State {
@@ -512,4 +641,20 @@ pub struct Noop;
 
 impl<I: wayland_client::Proxy> Dispatch2<I, State> for Noop {
     fn event(&self, _: &mut State, _: &I, _: I::Event, _: &Connection, _: &QueueHandle<State>) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_requests() {
+        assert_eq!(Request::parse("key C"), Ok(Request::Key('c')));
+        assert_eq!(Request::parse("  overlay "), Ok(Request::Overlay));
+        assert_eq!(Request::parse("status"), Ok(Request::Status));
+        assert!(Request::parse("key 1").is_err());
+        assert!(Request::parse("key ab").is_err());
+        assert!(Request::parse("key").is_err());
+        assert!(Request::parse("overlay now").is_err());
+    }
 }
