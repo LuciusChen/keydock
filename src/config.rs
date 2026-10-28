@@ -49,11 +49,28 @@ pub struct Config {
     pub font: Option<String>,
     #[serde(default)]
     pub hide: Hide,
+    /// Modifier name shown before the letter in the overlay, e.g. "Hyper".
+    pub key_label: Option<String>,
+    /// Chord sent after focusing an app so the compositor warps the pointer,
+    /// e.g. "super+ctrl+alt+shift+p". Empty disables the warp.
+    pub warp: Option<String>,
     #[serde(default, rename = "app")]
     pub apps: Vec<AppEntry>,
 }
 
+pub const DEFAULT_WARP: &str = "super+ctrl+alt+shift+p";
+
 impl Config {
+    pub fn key_label(&self) -> &str {
+        self.key_label.as_deref().unwrap_or("Super")
+    }
+
+    /// The warp chord, or None when disabled.
+    pub fn warp(&self) -> Option<&str> {
+        let chord = self.warp.as_deref().unwrap_or(DEFAULT_WARP).trim();
+        (!chord.is_empty() && !chord.eq_ignore_ascii_case("none")).then_some(chord)
+    }
+
     pub fn path() -> PathBuf {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)

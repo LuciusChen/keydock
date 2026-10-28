@@ -35,11 +35,6 @@ pub struct Window {
     pub minimized: bool,
 }
 
-/// Super+Ctrl+Alt+Shift+P: a compositor keybind that warps the pointer to the
-/// active window. The foreign-toplevel protocol exposes no geometry, so the
-/// compositor has to do the warp.
-const WARP_KEY: u32 = 25; // evdev KEY_P
-
 pub struct Windows {
     /// Most recently used first. Windows never activated sit at the end.
     pub list: Vec<Window>,
@@ -49,8 +44,11 @@ pub struct Windows {
     launching: Vec<(String, Instant)>,
     seat: Option<WlSeat>,
     vk_manager: Option<ZwpVirtualKeyboardManagerV1>,
-    vk: Option<(ZwpVirtualKeyboardV1, u32)>,
+    vk: Option<(ZwpVirtualKeyboardV1, xkbcommon::xkb::Keymap)>,
     time: Instant,
+    /// Chord that makes the compositor warp the pointer to the active window
+    /// (the foreign-toplevel protocol exposes no geometry). None disables it.
+    pub warp_chord: Option<String>,
     /// Learned on the first automatic hide: some compositors ignore minimize requests.
     pub minimize_works: Option<bool>,
 }
@@ -75,6 +73,7 @@ impl Windows {
             vk_manager,
             vk: None,
             time: Instant::now(),
+            warp_chord: None,
             minimize_works: None,
         }
     }
@@ -235,46 +234,81 @@ impl Windows {
     /// Sends the warp chord on the same connection right after the activate
     /// requests, so the compositor handles it after focus has moved.
     fn warp_pointer(&mut self, qh: &QueueHandle<State>) {
-        let Some(vk) = self.virtual_keyboard(qh) else { return };
-        let (vk, mods) = (vk.0.clone(), vk.1);
+        let Some(chord) = self.warp_chord.clone() else { return };
+        let Some((vk, keymap)) = self.virtual_keyboard(qh) else { return };
+        let Some((code, mods)) = parse_chord(keymap, &chord) else {
+            eprintln!("keydock: cannot parse warp chord {chord:?}");
+            return;
+        };
+        let vk = vk.clone();
         let t = self.time.elapsed().as_millis() as u32;
         vk.modifiers(mods, 0, 0, 0);
-        vk.key(t, WARP_KEY, 1);
-        vk.key(t + 1, WARP_KEY, 0);
+        vk.key(t, code, 1);
+        vk.key(t + 1, code, 0);
         vk.modifiers(0, 0, 0, 0);
     }
 
-    fn virtual_keyboard(&mut self, qh: &QueueHandle<State>) -> Option<&(ZwpVirtualKeyboardV1, u32)> {
+    fn virtual_keyboard(&mut self, qh: &QueueHandle<State>) -> Option<&(ZwpVirtualKeyboardV1, xkbcommon::xkb::Keymap)> {
         if self.vk.is_none() {
             let (manager, seat) = (self.vk_manager.as_ref()?, self.seat.as_ref()?);
-            let (fd, size, mods) = us_keymap()?;
+            let (keymap, fd, size) = us_keymap()?;
             let vk = manager.create_virtual_keyboard(seat, qh, crate::Noop);
             vk.keymap(1, fd.as_fd(), size);
-            self.vk = Some((vk, mods));
+            self.vk = Some((vk, keymap));
         }
         self.vk.as_ref()
     }
 }
 
-/// A US keymap in a memfd, plus the Shift|Control|Mod1|Mod4 mask.
-fn us_keymap() -> Option<(OwnedFd, u32, u32)> {
+/// Parses "super+ctrl+alt+shift+p" into an evdev key code and a modifier mask.
+fn parse_chord(keymap: &xkbcommon::xkb::Keymap, chord: &str) -> Option<(u32, u32)> {
+    use xkbcommon::xkb;
+    let (mut mask, mut key) = (0u32, None);
+    for part in chord.split('+').map(str::trim).filter(|p| !p.is_empty()) {
+        let modifier = match part.to_lowercase().as_str() {
+            "super" | "logo" | "win" | "mod4" => Some("Mod4"),
+            "ctrl" | "control" => Some("Control"),
+            "alt" | "mod1" => Some("Mod1"),
+            "shift" => Some("Shift"),
+            _ => None,
+        };
+        match modifier {
+            Some(name) => {
+                let i = keymap.mod_get_index(name);
+                if i == xkb::MOD_INVALID {
+                    return None;
+                }
+                mask |= 1 << i;
+            }
+            None if key.is_none() => key = Some(part),
+            None => return None,
+        }
+    }
+    let sym = xkb::keysym_from_name(key?, xkb::KEYSYM_CASE_INSENSITIVE);
+    if sym.raw() == 0 {
+        return None;
+    }
+    // Find the key that produces the symbol without modifiers; evdev = xkb - 8.
+    let (min, max) = (keymap.min_keycode().raw(), keymap.max_keycode().raw());
+    (min..=max)
+        .find(|&kc| keymap.key_get_syms_by_level(xkb::Keycode::new(kc), 0, 0).contains(&sym))
+        .map(|kc| (kc - 8, mask))
+}
+
+/// A US keymap, serialized into a memfd for the virtual keyboard.
+fn us_keymap() -> Option<(xkbcommon::xkb::Keymap, OwnedFd, u32)> {
     use xkbcommon::xkb;
     let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
     let keymap = xkb::Keymap::new_from_names(&ctx, "", "", "us", "", None, xkb::KEYMAP_COMPILE_NO_FLAGS)?;
     let mut text = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1).into_bytes();
     text.push(0);
-    let mask = ["Shift", "Control", "Mod1", "Mod4"]
-        .iter()
-        .map(|m| keymap.mod_get_index(m))
-        .filter(|&i| i != xkb::MOD_INVALID)
-        .fold(0u32, |acc, i| acc | (1 << i));
     let fd = unsafe { libc::memfd_create(c"keydock-keymap".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return None;
     }
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     file.write_all(&text).ok()?;
-    Some((file.into(), text.len() as u32, mask))
+    Some((keymap, file.into(), text.len() as u32))
 }
 
 /// User data for the foreign-toplevel manager.

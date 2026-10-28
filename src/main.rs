@@ -264,6 +264,7 @@ impl State {
         if self.overlay.is_open() {
             self.overlay.close();
         }
+        self.windows.warp_chord = cfg.warp().map(str::to_string);
         let Some(app) = cfg.by_key(&key.to_string()) else { return self.open_overlay(Mode::Assign(key)) };
         if let Some(check) = self.windows.toggle(&self.qh, &app.app_id, app.exec.as_deref(), cfg.hide)? {
             // Give the compositor time to report the minimized state.
@@ -359,7 +360,7 @@ impl State {
                 }
             }
             Mode::Assign(k) => Content {
-                title: Some(format!("Super+{} 还没有绑定应用", k.to_ascii_uppercase())),
+                title: Some(format!("{}+{} 还没有绑定应用", cfg.key_label(), k.to_ascii_uppercase())),
                 sections: vec![Section { title: "按数字把它绑定到这个按键".into(), rows: numbered }],
                 hint: "Esc 取消".into(),
             },
@@ -387,6 +388,7 @@ impl State {
             return;
         };
         let Ok(cfg) = load_config() else { return };
+        self.windows.warp_chord = cfg.warp().map(str::to_string);
         let target = c.to_digit(10).and_then(|d| self.overlay_targets.get((d as usize).checked_sub(1)?)).cloned();
         let result = match (&self.overlay.mode, target) {
             (Some(Mode::Browse), Some(app_id)) => {

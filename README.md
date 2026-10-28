@@ -34,6 +34,8 @@ keydock daemon         run the background service (other commands start it if ne
 ```toml
 font = "sans"          # optional overlay font
 hide = "auto"          # auto | minimize | previous (focus the previous app)
+key_label = "Super"    # modifier name shown in the overlay, e.g. "Hyper"
+warp = "super+ctrl+alt+shift+p"  # chord for the compositor's cursor warp; "" disables it
 
 [[app]]
 key = "c"
@@ -71,7 +73,9 @@ niri, Hyprland and sway implement these protocols but are untested; GNOME and KD
 ## Compositor setup (labwc)
 
 Bind every free Super+letter to `keydock key <letter>` (on release), Super+/ to
-`keydock overlay`, and add the cursor-warp callback keydock sends after focusing an app:
+`keydock overlay`, and add the cursor-warp callback keydock sends after focusing an app.
+Any modifier works: the letter after `key` only names the app, so Hyper or Alt bindings are
+fine. Set `key_label` to match, and keep the `warp` chord free of app bindings.
 
 ```xml
 <keybind key="W-c" onRelease="yes"><action name="Execute" command="keydock key c" /></keybind>
