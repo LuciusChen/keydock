@@ -1,0 +1,25 @@
+[package]
+name = "keydock"
+version = "0.1.0"
+edition = "2024"
+description = "Pin apps to Super+letter keys on wlroots compositors"
+license = "MIT"
+
+[dependencies]
+smithay-client-toolkit = "0.21"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+cairo-rs = "0.22"
+pango = "0.22"
+pangocairo = "0.22"
+resvg = "0.49"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+libc = "0.2"
+xkbcommon = "0.8"
+
+[profile.release]
+lto = "thin"
+strip = true
