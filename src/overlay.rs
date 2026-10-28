@@ -20,6 +20,7 @@ use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
 
+use crate::config::Config;
 use crate::{Noop, State};
 
 pub enum Mode {
@@ -181,15 +182,10 @@ impl Overlay {
     }
 
     /// Shows `content`, or replaces what an open overlay shows.
-    pub fn open(
-        &mut self,
-        qh: &QueueHandle<State>,
-        mode: Mode,
-        content: Content,
-        font: Option<&str>,
-    ) {
+    pub fn open(&mut self, qh: &QueueHandle<State>, mode: Mode, content: Content, cfg: &Config) {
         self.theme = Theme::load();
-        self.font = font.unwrap_or("sans").to_string();
+        self.theme.surface = self.theme.surface.alpha(cfg.opacity());
+        self.font = cfg.font.as_deref().unwrap_or("sans").to_string();
         let (w, h) = self.measure(&content);
         self.size = (w, h);
         self.content = Some(content);

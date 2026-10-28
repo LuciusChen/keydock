@@ -47,6 +47,8 @@ const DEFAULT_WARP: &str = "super+ctrl+alt+shift+p";
 pub struct Config {
     /// Overlay font family.
     pub font: Option<String>,
+    /// Overlay background opacity, 0.0 to 1.0.
+    opacity: Option<f64>,
     #[serde(default)]
     pub hide: Hide,
     /// Modifier name shown before the letter in the overlay.
@@ -102,6 +104,10 @@ impl Config {
         self.key_label.as_deref().unwrap_or("Super")
     }
 
+    pub fn opacity(&self) -> f64 {
+        self.opacity.unwrap_or(1.0).clamp(0.0, 1.0)
+    }
+
     /// The warp chord, or None when disabled.
     pub fn warp(&self) -> Option<&str> {
         let chord = self.warp.as_deref().unwrap_or(DEFAULT_WARP).trim();
@@ -155,6 +161,7 @@ mod tests {
             hide = "previous"
             key_label = "Hyper"
             warp = "alt+super+f12"
+            opacity = 0.8
 
             [[app]]
             key = "c"
@@ -166,6 +173,7 @@ mod tests {
         assert_eq!(cfg.hide, Hide::Previous);
         assert_eq!(cfg.key_label(), "Hyper");
         assert_eq!(cfg.warp(), Some("alt+super+f12"));
+        assert_eq!(cfg.opacity(), 0.8);
         assert_eq!(cfg.by_key('C').unwrap().exec.as_deref(), Some("kitty"));
         assert!(cfg.by_app_id("Kitty").is_some());
     }
@@ -176,6 +184,8 @@ mod tests {
         assert_eq!(cfg.hide, Hide::Auto);
         assert_eq!(cfg.key_label(), "Super");
         assert_eq!(cfg.warp(), Some(DEFAULT_WARP));
+        assert_eq!(cfg.opacity(), 1.0);
+        assert_eq!(Config::parse("opacity = 3.0").unwrap().opacity(), 1.0);
     }
 
     #[test]

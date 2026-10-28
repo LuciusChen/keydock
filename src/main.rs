@@ -414,8 +414,7 @@ impl State {
             },
         };
         self.overlay_targets = targets;
-        self.overlay
-            .open(&self.qh, mode, content, cfg.font.as_deref());
+        self.overlay.open(&self.qh, mode, content, &cfg);
         Ok(())
     }
 

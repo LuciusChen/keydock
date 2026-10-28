@@ -37,6 +37,7 @@ font = "sans"          # optional overlay font
 hide = "auto"          # auto | minimize | previous (focus the previous app)
 key_label = "Super"    # modifier name shown in the overlay, e.g. "Hyper"
 warp = "super+ctrl+alt+shift+p"  # chord for the compositor's cursor warp; "" disables it
+opacity = 1.0          # overlay background opacity, 0.0 to 1.0
 
 [[app]]
 key = "c"
