@@ -15,7 +15,8 @@ Pin applications to Super+letter keys on wlroots compositors (labwc, niri, Hyprl
 keydock tracks its own most-recently-used window order through
 `wlr-foreign-toplevel-management`, so the behaviour does not depend on compositor internals.
 The overlay is a layer-shell surface drawn with cairo and pango, with fractional scaling.
-Its labels are currently in Chinese.
+Its text follows the session language (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`):
+English, Simplified Chinese and Traditional Chinese are included, with English as the fallback.
 
 ## Commands
 

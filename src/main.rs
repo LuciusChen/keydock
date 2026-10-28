@@ -5,6 +5,7 @@
 
 mod config;
 mod desktop;
+mod i18n;
 mod overlay;
 mod windows;
 
@@ -342,6 +343,7 @@ impl State {
             .enumerate()
             .map(|(i, id)| self.row(char::from(b'1' + i as u8), id, None, true))
             .collect();
+        let text = i18n::current();
         let content = match mode {
             Mode::Browse => {
                 let pinned: Vec<Row> = cfg
@@ -353,16 +355,20 @@ impl State {
                 Content {
                     title: None,
                     sections: vec![
-                        Section { title: "已固定".into(), rows: pinned },
-                        Section { title: "已打开".into(), rows: numbered },
+                        Section { title: text.pinned.into(), rows: pinned },
+                        Section { title: text.open.into(), rows: numbered },
                     ],
-                    hint: "按字母或数字切换 · Esc 关闭".into(),
+                    hint: text.browse_hint.into(),
+                    empty: text.none.into(),
                 }
             }
             Mode::Assign(k) => Content {
-                title: Some(format!("{}+{} 还没有绑定应用", cfg.key_label(), k.to_ascii_uppercase())),
-                sections: vec![Section { title: "按数字把它绑定到这个按键".into(), rows: numbered }],
-                hint: "Esc 取消".into(),
+                title: Some(
+                    text.unassigned.replace("{key}", &format!("{}+{}", cfg.key_label(), k.to_ascii_uppercase())),
+                ),
+                sections: vec![Section { title: text.assign_section.into(), rows: numbered }],
+                hint: text.assign_hint.into(),
+                empty: text.none.into(),
             },
         };
         self.overlay_targets = targets;

@@ -45,6 +45,8 @@ pub struct Content {
     pub title: Option<String>,
     pub sections: Vec<Section>,
     pub hint: String,
+    /// Shown in a section without rows.
+    pub empty: String,
 }
 
 #[derive(Clone, Copy)]
@@ -332,7 +334,7 @@ fn paint(
         text(&l, PAD + 2.0, y + 6.0, t.on_surface_variant);
         y += SECTION_H;
         if s.rows.is_empty() {
-            let l = layout("（无）", 13.0, false);
+            let l = layout(&c.empty, 13.0, false);
             text(&l, PAD + 2.0, y + (ROW_H - l.pixel_size().1 as f64) / 2.0, t.on_surface_variant.alpha(0.7));
             y += ROW_H;
         }
