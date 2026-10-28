@@ -86,6 +86,21 @@ fine. Set `key_label` to match, and keep the `warp` chord free of app bindings.
 
 Start `keydock daemon` from the session autostart. Any other command starts it if needed.
 
+## Using a held key such as Tab
+
+Any key can trigger keydock if a remapper turns it into a chord. With
+[kanata](https://github.com/jtroo/kanata), tapping Tab still types Tab while holding it turns
+letters into Ctrl+Alt+Super+letter, which leaves Super+letter free:
+
+```lisp
+(defalias tab-apps (tap-hold-release 200 200 tab (layer-while-held apps)))
+(deflayermap (base) tab @tab-apps)
+(deflayermap (apps) a C-A-M-a  b C-A-M-b  c C-A-M-c  ;; ... through z
+                    / C-A-M-/)
+```
+
+Then bind `W-C-A-<letter>` to `keydock key <letter>` and set `key_label = "Tab"`.
+
 ## Other compositors (untested)
 
 Bind the same commands; the cursor-warp chord is only needed where the compositor does not
