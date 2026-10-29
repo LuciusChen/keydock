@@ -1,16 +1,17 @@
 # keydock
 
-Pin applications to Super+letter keys on wlroots compositors (labwc, niri, Hyprland, sway).
+Pin applications to letter keys on wlroots compositors (labwc, niri, Hyprland, sway).
+The examples bind Super+letter; any trigger that runs `keydock key <letter>` works.
 
-- **Super+letter** focuses the pinned app, hides it when it is already focused, or launches it.
+- **A pinned letter** focuses the app, hides it when it is already focused, or launches it.
   All of the app's windows come forward together and the most recently used one ends on top.
   Windows you minimized one by one stay minimized.
 - **Hiding** minimizes the app's windows. Tiling compositors (niri, Hyprland, sway) ignore
   minimize requests; keydock notices on the first hide and switches to focusing the previous
   app instead, like Cmd+Tab. `keydock status` shows which behaviour is in use.
-- **Super+/** shows an overlay with the pinned apps and the open, unpinned apps. Letters and
-  numbers in the overlay switch to an app; Esc closes it.
-- **An unpinned Super+letter** opens the overlay so you can pin an open app to that letter.
+- **The overlay** (Super+/ in the examples) lists the pinned apps and the open, unpinned apps.
+  Letters and numbers in the overlay switch to an app; Esc closes it.
+- **An unpinned letter** opens the overlay so you can pin an open app to that letter.
 
 keydock tracks its own most-recently-used window order through
 `wlr-foreign-toplevel-management`, so the behaviour does not depend on compositor internals.
@@ -77,7 +78,8 @@ niri, Hyprland and sway implement these protocols but are untested; GNOME and KD
 Bind every free Super+letter to `keydock key <letter>` (on release), Super+/ to
 `keydock overlay`, and add the cursor-warp callback keydock sends after focusing an app.
 Any modifier works: the letter after `key` only names the app, so Hyper or Alt bindings are
-fine. Set `key_label` to match, and keep the `warp` chord free of app bindings.
+fine, and so is a key remapper such as kanata running the command directly. Set `key_label`
+to match, and keep the `warp` chord free of app bindings.
 
 ```xml
 <keybind key="W-c" onRelease="yes"><action name="Execute" command="keydock key c" /></keybind>
