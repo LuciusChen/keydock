@@ -18,8 +18,11 @@ pub enum Action {
     Activate(Id),
     Unminimize(Id),
     Minimize(Id),
-    /// Run a shell command to start an app.
-    Launch(String),
+    /// Restore the app from its tray icon, or run the shell command to start it.
+    Launch {
+        app_id: String,
+        exec: String,
+    },
     /// Ask the compositor to move the pointer to the focused window.
     Warp,
 }
@@ -236,7 +239,10 @@ impl Tracker {
             return Ok(Vec::new());
         }
         self.launching.push((app_id.to_string(), Instant::now()));
-        Ok(vec![Action::Launch(exec.to_string())])
+        Ok(vec![Action::Launch {
+            app_id: app_id.to_string(),
+            exec: exec.to_string(),
+        }])
     }
 }
 
@@ -300,7 +306,10 @@ mod tests {
         let mut t = tracker(&[(1, "term", false)]);
         assert_eq!(
             t.show("web", Some("firefox")).unwrap(),
-            [Launch("firefox".into())]
+            [Launch {
+                app_id: "web".into(),
+                exec: "firefox".into()
+            }]
         );
         assert_eq!(t.show("web", Some("firefox")).unwrap(), []);
         assert!(t.show("chat", None).is_err());
@@ -315,7 +324,10 @@ mod tests {
         t.remove(2);
         assert_eq!(
             t.show("web", Some("firefox")).unwrap(),
-            [Launch("firefox".into())]
+            [Launch {
+                app_id: "web".into(),
+                exec: "firefox".into()
+            }]
         );
     }
 

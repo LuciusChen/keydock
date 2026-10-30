@@ -24,6 +24,7 @@ use xkbcommon::xkb;
 
 use crate::State;
 use crate::tracker::{Action, Id, Tracker};
+use crate::tray;
 
 pub struct Windows {
     pub tracker: Tracker,
@@ -66,7 +67,11 @@ impl Windows {
                 }
                 Action::Unminimize(id) => self.handle(*id)?.unset_minimized(),
                 Action::Minimize(id) => self.handle(*id)?.set_minimized(),
-                Action::Launch(exec) => launch(exec)?,
+                Action::Launch { app_id, exec } => {
+                    if !tray::activate(app_id) {
+                        launch(exec)?;
+                    }
+                }
                 Action::Warp => {
                     if let Some(chord) = warp {
                         self.send_chord(qh, chord)?;

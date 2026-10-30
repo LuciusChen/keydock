@@ -5,7 +5,8 @@ The examples bind Super+letter; any trigger that runs `keydock key <letter>` wor
 
 - **A pinned letter** focuses the app, hides it when it is already focused, or launches it.
   All of the app's windows come forward together and the most recently used one ends on top.
-  Windows you minimized one by one stay minimized.
+  Windows you minimized one by one stay minimized. An app that closed to the tray is restored
+  from its tray icon instead of being launched again, when its executable is named like its app id.
 - **Hiding** minimizes the app's windows. Tiling compositors (niri, Hyprland, sway) ignore
   minimize requests; keydock notices on the first hide and switches to focusing the previous
   app instead, like Cmd+Tab. `keydock status` shows which behaviour is in use.
@@ -129,6 +130,7 @@ CI runs the same checks. The code is split so the decisions can be tested withou
 |---|---|
 | `src/tracker.rs` | Window list in most-recently-used order and the show/hide decisions, returned as actions. No Wayland types; most tests live here. |
 | `src/windows.rs` | Feeds foreign-toplevel events into the tracker and sends its actions to the compositor. |
+| `src/tray.rs` | Restores an app from its StatusNotifierItem tray icon over D-Bus before launching it. |
 | `src/config.rs` | Loading, validating and appending to `config.toml`. |
 | `src/overlay.rs` | The layer-shell overlay, drawn with cairo and pango. |
 | `src/desktop.rs` | Desktop entries and icon-theme lookup. |

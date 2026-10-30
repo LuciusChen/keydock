@@ -8,6 +8,7 @@ mod desktop;
 mod i18n;
 mod overlay;
 mod tracker;
+mod tray;
 mod windows;
 
 use std::io::{BufRead, BufReader, Read, Write};

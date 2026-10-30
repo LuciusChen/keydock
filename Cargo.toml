@@ -25,6 +25,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 libc = "0.2"
 xkbcommon = "0.8"
+gio = "0.22"
 
 [profile.release]
 lto = "thin"
