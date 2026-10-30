@@ -9,6 +9,8 @@ pub struct Strings {
     pub unassigned: &'static str,
     pub assign_section: &'static str,
     pub assign_hint: &'static str,
+    /// Shown when no open app can be pinned; the overlay then closes itself.
+    pub assign_nothing: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -19,6 +21,7 @@ const EN: Strings = Strings {
     unassigned: "{key} has no app yet",
     assign_section: "Press a number to pin that app to this key",
     assign_hint: "Esc to cancel",
+    assign_nothing: "No open app to pin. Open the app, then press this key again.",
 };
 
 const ZH_CN: Strings = Strings {
@@ -29,6 +32,7 @@ const ZH_CN: Strings = Strings {
     unassigned: "{key} 还没有绑定应用",
     assign_section: "按数字把它绑定到这个按键",
     assign_hint: "Esc 取消",
+    assign_nothing: "没有可绑定的应用，先打开它再按一次这个键",
 };
 
 const ZH_TW: Strings = Strings {
@@ -39,6 +43,7 @@ const ZH_TW: Strings = Strings {
     unassigned: "{key} 尚未綁定應用程式",
     assign_section: "按數字把它綁定到這個按鍵",
     assign_hint: "Esc 取消",
+    assign_nothing: "沒有可綁定的應用程式，先開啟它再按一次這個鍵",
 };
 
 /// Preferred languages such as "zh_CN", most preferred first, following

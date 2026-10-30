@@ -162,6 +162,8 @@ pub struct State {
     pub overlay: Overlay,
     /// App ids behind the overlay's number keys, in display order.
     overlay_targets: Vec<String>,
+    /// Counts overlay openings, so a pending auto-close skips a newer overlay.
+    overlay_serial: u64,
     desktop: DesktopIndex,
     desktop_loaded: Instant,
     icons: IconFinder,
@@ -207,6 +209,7 @@ fn daemon() -> Result<(), String> {
         windows: Windows::new(vk_manager),
         overlay: Overlay::new(overlay_globals),
         overlay_targets: Vec::new(),
+        overlay_serial: 0,
         desktop: DesktopIndex::load(),
         desktop_loaded: Instant::now(),
         icons: IconFinder::new(),
@@ -377,6 +380,8 @@ impl State {
             .map(|(i, id)| self.row(char::from(b'1' + i as u8), id, None, true))
             .collect();
         let text = i18n::strings(&i18n::languages());
+        // An unpinned key with nothing to pin: say so and close on its own.
+        let nothing_to_pin = matches!(mode, Mode::Assign(_)) && targets.is_empty();
         let content = match mode {
             Mode::Browse => {
                 let pinned: Vec<Row> = cfg
@@ -405,17 +410,44 @@ impl State {
                     "{key}",
                     &format!("{}+{}", cfg.key_label(), k.to_ascii_uppercase()),
                 )),
-                sections: vec![Section {
-                    title: text.assign_section.into(),
-                    rows: numbered,
-                }],
-                hint: text.assign_hint.into(),
+                sections: if nothing_to_pin {
+                    Vec::new()
+                } else {
+                    vec![Section {
+                        title: text.assign_section.into(),
+                        rows: numbered,
+                    }]
+                },
+                hint: if nothing_to_pin {
+                    text.assign_nothing.into()
+                } else {
+                    text.assign_hint.into()
+                },
                 empty: text.none.into(),
             },
         };
         self.overlay_targets = targets;
+        self.overlay_serial += 1;
         self.overlay.open(&self.qh, mode, content, &cfg);
+        if nothing_to_pin {
+            self.close_overlay_later();
+        }
         Ok(())
+    }
+
+    /// Closes the overlay shortly, unless another one opened meanwhile.
+    fn close_overlay_later(&mut self) {
+        let serial = self.overlay_serial;
+        let delay = Duration::from_millis(1500);
+        let _ = self
+            .event_loop
+            .insert_source(Timer::from_duration(delay), move |_, _, state| {
+                if state.overlay_serial == serial {
+                    state.overlay.close();
+                    let _ = state.conn.flush();
+                }
+                TimeoutAction::Drop
+            });
     }
 
     /// A key typed into the overlay: Esc closes it, letters and numbers

@@ -11,7 +11,8 @@ The examples bind Super+letter; any trigger that runs `keydock key <letter>` wor
   app instead, like Cmd+Tab. `keydock status` shows which behaviour is in use.
 - **The overlay** (Super+/ in the examples) lists the pinned apps and the open, unpinned apps.
   Letters and numbers in the overlay switch to an app; Esc closes it.
-- **An unpinned letter** opens the overlay so you can pin an open app to that letter.
+- **An unpinned letter** opens the overlay so you can pin an open app to that letter;
+  with no open app to pin, it says so and closes itself.
 
 keydock tracks its own most-recently-used window order through
 `wlr-foreign-toplevel-management`, so the behaviour does not depend on compositor internals.
