@@ -703,10 +703,10 @@ impl LayerShellHandler for State {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &LayerSurface,
-        _: LayerSurfaceConfigure,
+        configure: LayerSurfaceConfigure,
         _: u32,
     ) {
-        self.overlay.configured(&self.shm);
+        self.overlay.configured(configure.new_size, &self.shm);
     }
 }
 

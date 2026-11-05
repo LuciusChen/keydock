@@ -63,6 +63,8 @@ pub struct Tracker {
     workspace: Option<Id>,
     /// The window that kept focus through the last workspace change, and where it was.
     moved: Option<(Id, Option<Id>, Instant)>,
+    /// When a window last got focus.
+    focused_at: Option<Instant>,
 }
 
 impl Tracker {
@@ -102,6 +104,9 @@ impl Tracker {
         };
         let was_activated = self.list[i].activated;
         self.list[i].activated = activated;
+        if activated && !was_activated {
+            self.focused_at = Some(Instant::now());
+        }
         if activated {
             self.list[i].workspace = self.workspace;
         } else if was_activated
@@ -125,19 +130,28 @@ impl Tracker {
     /// focus stays on the active workspace, so a focused window is there. One
     /// that keeps focus through the change moved along with it, unless it loses
     /// focus right after: focusing a window elsewhere changes the workspace first.
+    /// A window that got focus just before arrived with the change, as switching
+    /// workspace moves focus first, so it has nothing to go back to.
     pub fn set_workspace(&mut self, workspace: Option<Id>) {
         if self.workspace == workspace {
             return;
         }
         self.workspace = workspace;
+        let arrived = self.focused_at.is_some_and(|t| t.elapsed() < MOVE_GRACE);
         if let Some(w) = self.list.iter_mut().find(|w| w.activated) {
-            self.moved = Some((w.id, w.workspace, Instant::now()));
+            self.moved = (!arrived).then(|| (w.id, w.workspace, Instant::now()));
             w.workspace = workspace;
         }
     }
 
     /// Forgets a removed workspace; the compositor moved its windows elsewhere.
     pub fn remove_workspace(&mut self, workspace: Id) {
+        if self
+            .moved
+            .is_some_and(|(_, from, _)| from == Some(workspace))
+        {
+            self.moved = None;
+        }
         for w in &mut self.list {
             if w.workspace == Some(workspace) {
                 w.workspace = None;
@@ -369,8 +383,31 @@ mod tests {
     }
 
     #[test]
+    fn a_window_focused_just_before_the_change_arrived_with_it() {
+        let mut t = two_workspaces();
+        t.set_state(3, false, false);
+        t.set_state(1, true, false);
+        t.set_workspace(Some(10));
+        t.set_state(1, false, false);
+        let on = t.list.iter().find(|w| w.id == 1).unwrap().workspace;
+        assert_eq!(on, Some(10));
+    }
+
+    #[test]
+    fn a_removed_workspace_is_not_restored_to_a_window_leaving_it() {
+        let mut t = two_workspaces();
+        std::thread::sleep(MOVE_GRACE);
+        t.set_workspace(Some(10));
+        t.remove_workspace(20);
+        t.set_state(3, false, false);
+        let on = t.list.iter().find(|w| w.id == 3).unwrap().workspace;
+        assert_eq!(on, Some(10));
+    }
+
+    #[test]
     fn a_window_losing_focus_right_after_the_change_stays_behind() {
         let mut t = two_workspaces();
+        std::thread::sleep(MOVE_GRACE);
         t.set_workspace(Some(10));
         t.set_state(3, false, false);
         t.set_state(1, true, false);

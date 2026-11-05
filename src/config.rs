@@ -36,8 +36,8 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// The key text for the first of `languages` it is translated to; a
-    /// translation may cover only some keys.
+    /// The text by lowercase key name, for the first of `languages` it is
+    /// translated to; a translation may cover only some keys.
     pub fn labels(&self, languages: &[String]) -> HashMap<String, String> {
         let translation = languages.iter().find_map(|lang| {
             let primary = lang.split('_').next().unwrap_or(lang);
@@ -45,14 +45,11 @@ impl Layer {
                 .get(lang)
                 .or_else(|| self.translations.get(primary))
         });
-        let mut labels = self.keys.clone();
-        labels.extend(
-            translation
-                .into_iter()
-                .flatten()
-                .map(|(k, v)| (k.clone(), v.clone())),
-        );
-        labels
+        self.keys
+            .iter()
+            .chain(translation.into_iter().flatten())
+            .map(|(key, text)| (key.to_lowercase(), text.clone()))
+            .collect()
     }
 }
 
@@ -260,6 +257,22 @@ mod tests {
         assert_eq!(q(&["zh_TW"]), "關閉");
         assert_eq!(q(&["fr", "zh_CN"]), "关闭");
         assert_eq!(layer.labels(&["zh_CN".into()])["f"], "Fullscreen");
+
+        let cfg = Config::parse(
+            r#"
+            [[layer]]
+            name = "x"
+            prefix = "x"
+            [layer.keys]
+            Left = "Snap"
+            [layer.translations.zh]
+            left = "贴左"
+            "#,
+        )
+        .unwrap();
+        let labels = cfg.layer("x").unwrap().labels(&["zh".into()]);
+        assert_eq!(labels["left"], "贴左");
+        assert_eq!(labels.len(), 1);
     }
 
     #[test]

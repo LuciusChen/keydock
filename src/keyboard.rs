@@ -28,7 +28,7 @@ pub struct Keyboard {
     pub prefix: String,
     /// Apps, drawn as icons.
     pub apps: Vec<KeyApp>,
-    /// Text for other keys, by key label.
+    /// Text for other keys, by lowercase key label.
     pub labels: HashMap<String, String>,
 }
 
@@ -46,10 +46,7 @@ impl Keyboard {
     }
 
     fn label(&self, key: &str) -> Option<&str> {
-        self.labels
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-            .map(|(_, v)| v.as_str())
+        self.labels.get(&key.to_lowercase()).map(String::as_str)
     }
 
     /// Icons in the order `paint` draws the keys.

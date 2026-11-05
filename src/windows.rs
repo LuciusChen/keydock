@@ -13,7 +13,7 @@ use wayland_client::backend::ObjectData;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::{Connection, Proxy, QueueHandle};
 use wayland_protocols::ext::workspace::v1::client::{
-    ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1,
+    ext_workspace_group_handle_v1::{self as group, ExtWorkspaceGroupHandleV1},
     ext_workspace_handle_v1::{self as workspace, ExtWorkspaceHandleV1},
     ext_workspace_manager_v1::{self as workspaces, ExtWorkspaceManagerV1},
 };
@@ -27,9 +27,9 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
 };
 use xkbcommon::xkb;
 
+use crate::State;
 use crate::tracker::{Action, Id, Tracker};
 use crate::tray;
-use crate::{Noop, State};
 
 pub struct Windows {
     pub tracker: Tracker,
@@ -260,6 +260,7 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for Toplevel {
 /// User data for ext-workspace: only tells the tracker the active workspace,
 /// when there is just one.
 pub struct WorkspaceManager;
+struct WorkspaceGroup;
 struct Workspace;
 
 impl Dispatch2<ExtWorkspaceManagerV1, State> for WorkspaceManager {
@@ -284,10 +285,25 @@ impl Dispatch2<ExtWorkspaceManagerV1, State> for WorkspaceManager {
     fn event_created_child(opcode: u16, qh: &QueueHandle<State>) -> Arc<dyn ObjectData> {
         match opcode {
             workspaces::EVT_WORKSPACE_GROUP_OPCODE => {
-                qh.make_data::<ExtWorkspaceGroupHandleV1, _>(Noop)
+                qh.make_data::<ExtWorkspaceGroupHandleV1, _>(WorkspaceGroup)
             }
             workspaces::EVT_WORKSPACE_OPCODE => qh.make_data::<ExtWorkspaceHandleV1, _>(Workspace),
             _ => unreachable!("ext-workspace event {opcode} creates no object"),
+        }
+    }
+}
+
+impl Dispatch2<ExtWorkspaceGroupHandleV1, State> for WorkspaceGroup {
+    fn event(
+        &self,
+        _: &mut State,
+        handle: &ExtWorkspaceGroupHandleV1,
+        event: group::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let group::Event::Removed = event {
+            handle.destroy();
         }
     }
 }

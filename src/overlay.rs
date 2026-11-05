@@ -112,6 +112,8 @@ pub struct Overlay {
     /// Preferred scale in 1/120 units; kept across openings as a first guess.
     scale120: u32,
     size: (u32, u32),
+    /// Shrinks the drawing where the compositor offers less than `size`.
+    fit: f64,
     configured: bool,
     /// Compositors may repeat a configure; only new content needs drawing.
     stale: bool,
@@ -132,6 +134,7 @@ impl Overlay {
             viewport: None,
             scale120: 120,
             size: (0, 0),
+            fit: 1.0,
             configured: false,
             stale: false,
             pool: None,
@@ -164,6 +167,7 @@ impl Overlay {
             _ => KeyboardInteractivity::Exclusive,
         };
         self.size = (w, h);
+        self.fit = 1.0;
         self.keyboard = Some(keyboard);
         self.stale = true;
         self.mode = Some(mode);
@@ -204,8 +208,14 @@ impl Overlay {
         self.keyboard = None;
     }
 
-    pub fn configured(&mut self, shm: &Shm) {
+    /// `bounds` is the size the compositor configured; 0 leaves it to keydock.
+    pub fn configured(&mut self, bounds: (u32, u32), shm: &Shm) {
         self.configured = true;
+        let fit = fit_within(self.size, bounds);
+        if fit != self.fit {
+            self.fit = fit;
+            self.stale = true;
+        }
         if self.stale {
             self.draw(shm);
         }
@@ -236,14 +246,18 @@ impl Overlay {
         } else {
             scale.ceil()
         };
+        let shown = |n: u32| (n as f64 * self.fit).floor().max(1.0) as i32;
+        let (shown_w, shown_h) = (shown(w), shown(h));
         let (bw, bh) = (
-            (w as f64 * scale).ceil() as i32,
-            (h as f64 * scale).ceil() as i32,
+            (shown_w as f64 * scale).ceil() as i32,
+            (shown_h as f64 * scale).ceil() as i32,
         );
+        // Everything inside is drawn at its full size and scaled to fit.
+        let scale_in = scale * self.fit;
         let stride = bw * 4;
 
         let paths = keyboard.icon_paths();
-        let px = (scale * keyboard::ICON).round() as i32;
+        let px = (scale_in * keyboard::ICON).round() as i32;
         let icons: Vec<Option<cairo::ImageSurface>> = paths
             .into_iter()
             .map(|p| p.and_then(|p| self.icon(&p, px)))
@@ -253,10 +267,10 @@ impl Overlay {
             cairo::ImageSurface::create(cairo::Format::ARgb32, bw, bh).expect("cairo surface");
         {
             let cr = cairo::Context::new(&image).expect("cairo context");
-            cr.scale(scale, scale);
+            cr.scale(scale_in, scale_in);
             card(&cr, &self.theme, (w as f64, h as f64));
             let keyboard = self.keyboard.as_ref().expect("keyboard");
-            keyboard::paint(&cr, &self.theme, &self.font, keyboard, &icons, scale);
+            keyboard::paint(&cr, &self.theme, &self.font, keyboard, &icons, scale_in);
         }
         image.flush();
         let src_stride = image.stride() as usize;
@@ -279,7 +293,7 @@ impl Overlay {
         let layer = self.layer.as_ref().expect("layer");
         let surface = layer.wl_surface();
         if let Some(v) = &self.viewport {
-            v.set_destination(w as i32, h as i32);
+            v.set_destination(shown_w, shown_h);
         } else {
             surface.set_buffer_scale(scale as i32);
         }
@@ -295,6 +309,15 @@ impl Overlay {
             .or_insert_with(|| render_icon(path, px))
             .clone()
     }
+}
+
+/// How far to shrink `size` to fit `bounds`, where a 0 bound is no limit.
+fn fit_within(size: (u32, u32), bounds: (u32, u32)) -> f64 {
+    let ratio = |n: u32, bound: u32| match bound {
+        0 => 1.0,
+        _ => (bound as f64 / n as f64).min(1.0),
+    };
+    ratio(size.0, bounds.0).min(ratio(size.1, bounds.1))
 }
 
 /// The rounded background of the panel.
@@ -410,6 +433,15 @@ impl Dispatch2<WpFractionalScaleV1, State> for Scale {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fits_within_what_the_compositor_offers() {
+        assert_eq!(fit_within((800, 300), (0, 0)), 1.0);
+        assert_eq!(fit_within((800, 300), (1000, 1000)), 1.0);
+        assert_eq!(fit_within((800, 300), (800, 300)), 1.0);
+        assert_eq!(fit_within((800, 300), (400, 0)), 0.5);
+        assert_eq!(fit_within((800, 300), (400, 75)), 0.25);
+    }
 
     #[test]
     fn parses_hex_colors() {
