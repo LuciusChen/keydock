@@ -43,8 +43,8 @@ pub struct MinimizeCheck {
     pub windows: Vec<Id>,
 }
 
-/// How soon after a workspace change a window that loses focus was only leaving.
-const MOVE_GRACE: Duration = Duration::from_millis(100);
+/// How soon before a workspace change a focused window counts as arriving with it.
+const ARRIVAL_GRACE: Duration = Duration::from_millis(100);
 
 /// Ignore repeated presses for an app that is still starting.
 const LAUNCH_GRACE: Duration = Duration::from_secs(5);
@@ -61,8 +61,6 @@ pub struct Tracker {
     /// The one active workspace; unknown where it is unreported, or where each
     /// output has its own, and then keys act on every window.
     workspace: Option<Id>,
-    /// The window that kept focus through the last workspace change, and where it was.
-    moved: Option<(Id, Option<Id>, Instant)>,
     /// When a window last got focus.
     focused_at: Option<Instant>,
 }
@@ -109,12 +107,6 @@ impl Tracker {
         }
         if activated {
             self.list[i].workspace = self.workspace;
-        } else if was_activated
-            && let Some((moved, from, at)) = self.moved.take()
-            && moved == id
-            && at.elapsed() < MOVE_GRACE
-        {
-            self.list[i].workspace = from;
         }
         self.list[i].minimized = minimized;
         if !minimized {
@@ -127,31 +119,22 @@ impl Tracker {
     }
 
     /// Records the active workspace. No protocol says where a window is, but
-    /// focus stays on the active workspace, so a focused window is there. One
-    /// that keeps focus through the change moved along with it, unless it loses
-    /// focus right after: focusing a window elsewhere changes the workspace first.
-    /// A window that got focus just before arrived with the change, as switching
-    /// workspace moves focus first, so it has nothing to go back to.
+    /// focus stays on the active workspace, so a window is noted there when it
+    /// gets focus. Switching workspace can report the new focus first, so a window
+    /// focused just before the change arrived with it.
     pub fn set_workspace(&mut self, workspace: Option<Id>) {
         if self.workspace == workspace {
             return;
         }
         self.workspace = workspace;
-        let arrived = self.focused_at.is_some_and(|t| t.elapsed() < MOVE_GRACE);
-        if let Some(w) = self.list.iter_mut().find(|w| w.activated) {
-            self.moved = (!arrived).then(|| (w.id, w.workspace, Instant::now()));
+        let arrived = self.focused_at.is_some_and(|t| t.elapsed() < ARRIVAL_GRACE);
+        if arrived && let Some(w) = self.list.iter_mut().find(|w| w.activated) {
             w.workspace = workspace;
         }
     }
 
     /// Forgets a removed workspace; the compositor moved its windows elsewhere.
     pub fn remove_workspace(&mut self, workspace: Id) {
-        if self
-            .moved
-            .is_some_and(|(_, from, _)| from == Some(workspace))
-        {
-            self.moved = None;
-        }
         for w in &mut self.list {
             if w.workspace == Some(workspace) {
                 w.workspace = None;
@@ -176,11 +159,12 @@ impl Tracker {
 
     /// The windows of an app a key acts on, most recently used first: those on
     /// the active workspace, else those on the workspace of its latest window.
-    /// A window of unknown workspace counts as on any of them.
+    /// The focused window is on the active one, and a window of unknown
+    /// workspace counts as on any of them.
     fn nearby<'a>(&'a self, app_id: &'a str) -> Vec<&'a Window> {
         let on = |workspace: Option<Id>| -> Vec<&Window> {
             self.of_app(app_id)
-                .filter(|w| w.workspace.is_none() || w.workspace == workspace)
+                .filter(|w| w.activated || w.workspace.is_none() || w.workspace == workspace)
                 .collect()
         };
         if self.workspace.is_none() {
@@ -376,54 +360,29 @@ mod tests {
     }
 
     #[test]
-    fn a_window_moved_with_focus_follows_the_workspace() {
-        let mut t = two_workspaces();
-        t.set_workspace(Some(10));
-        assert_eq!(t.active().unwrap().workspace, Some(10));
-    }
-
-    #[test]
     fn a_window_focused_just_before_the_change_arrived_with_it() {
         let mut t = two_workspaces();
         t.set_state(3, false, false);
         t.set_state(1, true, false);
-        t.set_workspace(Some(10));
-        t.set_state(1, false, false);
-        let on = t.list.iter().find(|w| w.id == 1).unwrap().workspace;
-        assert_eq!(on, Some(10));
+        t.set_workspace(Some(30));
+        assert_eq!(t.active().unwrap().workspace, Some(30));
     }
 
     #[test]
-    fn a_removed_workspace_is_not_restored_to_a_window_leaving_it() {
+    fn a_window_focused_earlier_stays_noted_where_it_was() {
         let mut t = two_workspaces();
-        std::thread::sleep(MOVE_GRACE);
+        std::thread::sleep(ARRIVAL_GRACE);
         t.set_workspace(Some(10));
-        t.remove_workspace(20);
-        t.set_state(3, false, false);
-        let on = t.list.iter().find(|w| w.id == 3).unwrap().workspace;
-        assert_eq!(on, Some(10));
+        assert_eq!(t.active().unwrap().workspace, Some(20));
     }
 
     #[test]
-    fn a_window_losing_focus_right_after_the_change_stays_behind() {
+    fn the_focused_window_counts_as_on_the_active_workspace() {
         let mut t = two_workspaces();
-        std::thread::sleep(MOVE_GRACE);
+        std::thread::sleep(ARRIVAL_GRACE);
         t.set_workspace(Some(10));
-        t.set_state(3, false, false);
-        t.set_state(1, true, false);
-        let on = |t: &Tracker, id| t.list.iter().find(|w| w.id == id).unwrap().workspace;
-        assert_eq!(on(&t, 3), Some(20));
-        assert_eq!(on(&t, 1), Some(10));
-    }
-
-    #[test]
-    fn a_moved_window_stays_moved_when_it_loses_focus_later() {
-        let mut t = two_workspaces();
-        t.set_workspace(Some(10));
-        std::thread::sleep(MOVE_GRACE);
-        t.set_state(3, false, false);
-        let on = t.list.iter().find(|w| w.id == 3).unwrap().workspace;
-        assert_eq!(on, Some(10));
+        let (actions, _) = t.hide("b", Hide::Minimize);
+        assert_eq!(actions, [Minimize(3)]);
     }
 
     #[test]

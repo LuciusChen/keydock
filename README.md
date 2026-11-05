@@ -33,8 +33,8 @@ keydock tracks its own most-recently-used window order through
 No protocol says which workspace a window is on, so keydock notes the active workspace from
 `ext-workspace` whenever a window gets focus. A window that has not had focus since the daemon
 started counts as on every workspace. Keys act on every window where `ext-workspace` is missing
-or several workspaces are active at once, as with one per output. A window moved without focus,
-such as by `SendToDesktop` with `follow="no"`, keeps its old workspace until it next has focus.
+or several workspaces are active at once, as with one per output. A window moved to another
+workspace, such as by `SendToDesktop`, stays noted on the old one until it next gets focus.
 The overlay is a layer-shell surface drawn with cairo and pango, with fractional scaling.
 Its text follows the session language (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`) as the daemon
 saw it when it started: English, Simplified Chinese and Traditional Chinese are included, with
