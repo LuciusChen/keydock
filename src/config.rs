@@ -1,5 +1,6 @@
 //! The key -> application table in ~/.config/keydock/config.toml.
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,17 @@ pub struct AppEntry {
     pub exec: Option<String>,
     /// Name shown in the overlay instead of the desktop entry's.
     pub name: Option<String>,
+}
+
+/// A layer of another tool to show with `keydock peek <name>`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Layer {
+    pub name: String,
+    /// The key held for this layer: the title, and the key drawn highlighted.
+    pub prefix: String,
+    /// Text for each key of the keyboard, e.g. h = "←".
+    pub keys: HashMap<String, String>,
 }
 
 /// Exact match, or a versioned id such as "emacs-32-0-50" for "emacs".
@@ -57,6 +69,8 @@ pub struct Config {
     warp: Option<String>,
     #[serde(default, rename = "app")]
     pub apps: Vec<AppEntry>,
+    #[serde(default, rename = "layer")]
+    pub layers: Vec<Layer>,
 }
 
 impl Config {
@@ -118,6 +132,10 @@ impl Config {
         self.apps.iter().find(|a| a.key.eq_ignore_ascii_case(&key))
     }
 
+    pub fn layer(&self, name: &str) -> Option<&Layer> {
+        self.layers.iter().find(|l| l.name == name)
+    }
+
     pub fn by_app_id(&self, app_id: &str) -> Option<&AppEntry> {
         self.apps.iter().find(|a| app_id_matches(&a.app_id, app_id))
     }
@@ -152,6 +170,19 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_layers_by_name() {
+        let cfg = Config::parse(
+            "[[layer]]\nname = \"numnav\"\nprefix = \";\"\n[layer.keys]\nh = \"←\"\n\",\" = \"PgUp\"\n",
+        )
+        .unwrap();
+        let layer = cfg.layer("numnav").unwrap();
+        assert_eq!(layer.prefix, ";");
+        assert_eq!(layer.keys["h"], "←");
+        assert_eq!(layer.keys[","], "PgUp");
+        assert!(cfg.layer("other").is_none());
+    }
 
     #[test]
     fn parses_full_config() {

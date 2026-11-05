@@ -16,8 +16,9 @@ The examples bind Super+letter; any trigger that runs `keydock key <letter>` wor
   with no open app to pin, it says so and closes itself.
 - **Peeking**: when the trigger key is held for a moment, a keyboard shows the app on each
   letter, and it goes away when the key is released or a letter is pressed. It never takes
-  key input, so letters keep switching apps while it shows. This needs a trigger that reports
-  both press and release, such as a kanata layer key; see [Peeking with kanata](#peeking-with-kanata).
+  key input, so letters keep switching apps while it shows. Other layers can be shown the same
+  way. This needs a trigger that reports both press and release, such as a kanata layer key;
+  see [Peeking with kanata](#peeking-with-kanata).
 
 keydock tracks its own most-recently-used window order through
 `wlr-foreign-toplevel-management`, so the behaviour does not depend on compositor internals.
@@ -30,8 +31,8 @@ English, Simplified Chinese and Traditional Chinese are included, with English a
 ```text
 keydock key <letter>   focus, hide or launch the app pinned to <letter>
 keydock overlay        show or hide the overlay
-keydock peek           the trigger key is held: show the keyboard after a moment
-keydock peek off       the trigger key is released: hide it
+keydock peek [layer]   a layer's key is held: show it on a keyboard after a moment
+keydock peek off       the key is released: hide it
 keydock status         list tracked windows, most recently used first
 keydock reload         re-read desktop entries and icons
 keydock daemon         run the background service (other commands start it if needed)
@@ -52,6 +53,14 @@ opacity = 1.0          # overlay background opacity, 0.0 to 1.0; the peek keyboa
 key = "c"
 app_id = "kitty"       # as shown by `keydock status`; "emacs" also matches "emacs-32-0-50"
 exec = "kitty"         # launch command when no window exists
+
+[[layer]]              # optional, shown by `keydock peek numnav`
+name = "numnav"
+prefix = ";"           # the key held; highlighted when the keyboard has a key of that name
+
+[layer.keys]           # text for each key
+h = "←"
+n = "Home"
 ```
 
 Overlay colors are read from `~/.config/keydock/colors.toml` each time the overlay opens.
@@ -119,6 +128,17 @@ keyboard highlights Tab. Run the commands as the desktop user when kanata runs a
   / (cmd keydock overlay))
 ```
 
+A layer whose keys do not go through keydock can hide the keyboard on the first key, so it
+does not cover what you are doing:
+
+```lisp
+(deftemplate nn (key)
+  (multi $key (cmd keydock peek off)))
+
+(deflayermap (numnav)
+  h (t! nn left))
+```
+
 The `cmd` action needs `danger-enable-cmd yes` in `defcfg` and a kanata build with it enabled.
 
 ## Other compositors (untested)
@@ -163,7 +183,7 @@ CI runs the same checks. The code is split so the decisions can be tested withou
 | `src/tray.rs` | Restores an app from its StatusNotifierItem tray icon over D-Bus before launching it. |
 | `src/config.rs` | Loading, validating and appending to `config.toml`. |
 | `src/overlay.rs` | The layer-shell overlay, drawn with cairo and pango. |
-| `src/keyboard.rs` | The peek view: a keyboard with the pinned apps on their letters. |
+| `src/keyboard.rs` | The peek view: a keyboard showing what each key does in a layer. |
 | `src/desktop.rs` | Desktop entries and icon-theme lookup. |
 | `src/i18n.rs` | Session language and overlay text. |
 | `src/main.rs` | Command line, the daemon's socket and event loop, and wiring. |

@@ -12,6 +12,7 @@ mod tracker;
 mod tray;
 mod windows;
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -57,8 +58,9 @@ const USAGE: &str = "usage: keydock <command>
   key <letter>  focus, hide or launch the app pinned to <letter>;
                 an unpinned letter opens the overlay to pin an open app
   overlay       show or hide the overlay of pinned and open apps
-  peek          the trigger key is held: show the pinned apps on a keyboard
-                after a moment, until \"peek off\" or the next key
+  peek [layer]  a layer's key is held: show the layer on a keyboard after a
+                moment, until \"peek off\" or the next app key; without a
+                layer, shows the pinned apps
   status        list tracked windows, most recently used first
   reload        re-read desktop entries and icons";
 
@@ -135,8 +137,9 @@ fn client(line: &str) -> i32 {
 enum Request {
     Key(char),
     Overlay,
-    /// The trigger key was pressed (true) or released (false).
-    Peek(bool),
+    /// A layer's key was pressed; `None` is the pinned apps.
+    Peek(Option<String>),
+    PeekOff,
     Status,
     Reload,
 }
@@ -150,8 +153,9 @@ impl Request {
                 _ => Err(format!("not a letter: {k}")),
             },
             ["overlay"] => Ok(Request::Overlay),
-            ["peek"] => Ok(Request::Peek(true)),
-            ["peek", "off"] => Ok(Request::Peek(false)),
+            ["peek"] => Ok(Request::Peek(None)),
+            ["peek", "off"] => Ok(Request::PeekOff),
+            ["peek", layer] => Ok(Request::Peek(Some(layer.to_string()))),
             ["status"] => Ok(Request::Status),
             ["reload"] => Ok(Request::Reload),
             _ => Err(format!("unknown command: {line}\n{USAGE}")),
@@ -279,8 +283,8 @@ impl State {
             Request::Key(key) => self.key(key)?,
             Request::Overlay if self.overlay.is_open() => self.overlay.close(),
             Request::Overlay => self.open_overlay(Mode::Browse)?,
-            Request::Peek(true) => self.peek_later(),
-            Request::Peek(false) => self.end_peek(),
+            Request::Peek(layer) => self.peek_later(layer)?,
+            Request::PeekOff => self.end_peek(),
             Request::Status => return Ok(self.status()),
             Request::Reload => self.reload_desktop(),
         }
@@ -391,7 +395,12 @@ impl State {
 
     /// Shows the keyboard if the trigger key is still held after a moment, so
     /// a quick trigger+letter switches apps without it flashing up.
-    fn peek_later(&mut self) {
+    fn peek_later(&mut self, layer: Option<String>) -> Result<(), String> {
+        if let Some(name) = &layer {
+            Config::load()?
+                .layer(name)
+                .ok_or(format!("no layer named {name}"))?;
+        }
         self.peek_serial += 1;
         let serial = self.peek_serial;
         let delay = Duration::from_millis(400);
@@ -399,13 +408,14 @@ impl State {
             .event_loop
             .insert_source(Timer::from_duration(delay), move |_, _, state| {
                 if state.peek_serial == serial && !state.overlay.is_open() {
-                    if let Err(e) = state.open_peek() {
+                    if let Err(e) = state.open_peek(layer.as_deref()) {
                         eprintln!("keydock: {e}");
                     }
                     let _ = state.conn.flush();
                 }
                 TimeoutAction::Drop
             });
+        Ok(())
     }
 
     fn end_peek(&mut self) {
@@ -415,20 +425,31 @@ impl State {
         }
     }
 
-    fn open_peek(&mut self) -> Result<(), String> {
+    fn open_peek(&mut self, layer: Option<&str>) -> Result<(), String> {
         let cfg = Config::load()?;
-        self.refresh_desktop();
-        let apps = cfg
-            .apps
-            .iter()
-            .map(|a| self.row(a.key, &a.app_id, a.name.as_deref(), false))
-            .collect();
-        let text = i18n::strings(&i18n::languages());
-        let view = View::Keyboard(Keyboard {
-            title: text.peek_title.replace("{key}", cfg.key_label()),
-            held: cfg.key_label().to_string(),
-            apps,
-        });
+        let keyboard = match layer {
+            Some(name) => {
+                let layer = cfg.layer(name).ok_or(format!("no layer named {name}"))?;
+                Keyboard {
+                    prefix: layer.prefix.clone(),
+                    apps: Vec::new(),
+                    labels: layer.keys.clone(),
+                }
+            }
+            None => {
+                self.refresh_desktop();
+                Keyboard {
+                    prefix: cfg.key_label().to_string(),
+                    apps: cfg
+                        .apps
+                        .iter()
+                        .map(|a| self.row(a.key, &a.app_id, a.name.as_deref(), false))
+                        .collect(),
+                    labels: HashMap::new(),
+                }
+            }
+        };
+        let view = View::Keyboard(keyboard);
         self.overlay.open(&self.qh, Mode::Peek, view, &cfg);
         Ok(())
     }
@@ -747,8 +768,12 @@ mod tests {
         assert_eq!(Request::parse("key C"), Ok(Request::Key('c')));
         assert_eq!(Request::parse("  overlay "), Ok(Request::Overlay));
         assert_eq!(Request::parse("status"), Ok(Request::Status));
-        assert_eq!(Request::parse("peek"), Ok(Request::Peek(true)));
-        assert_eq!(Request::parse("peek off"), Ok(Request::Peek(false)));
+        assert_eq!(Request::parse("peek"), Ok(Request::Peek(None)));
+        assert_eq!(
+            Request::parse("peek numnav"),
+            Ok(Request::Peek(Some("numnav".into())))
+        );
+        assert_eq!(Request::parse("peek off"), Ok(Request::PeekOff));
         assert!(Request::parse("key 1").is_err());
         assert!(Request::parse("key ab").is_err());
         assert!(Request::parse("key").is_err());

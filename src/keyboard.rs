@@ -1,4 +1,6 @@
-//! The peek view: the keyboard with the app pinned to each letter.
+//! The peek view: a keyboard showing what each key does in a layer.
+
+use std::collections::HashMap;
 
 use crate::overlay::{Row, Theme, draw_icon, rounded, text_layout};
 
@@ -69,7 +71,7 @@ const ANSI: &[&[(&str, f64)]] = &[
         ("Ctrl", 1.5),
         ("Super", 1.25),
         ("Alt", 1.5),
-        ("", 7.0),
+        ("Space", 7.0),
         ("Alt", 1.5),
         ("Ctrl", 2.25),
     ],
@@ -83,11 +85,12 @@ const GAP: f64 = 4.0;
 pub const ICON: f64 = 26.0;
 
 pub struct Keyboard {
-    pub title: String,
-    /// Label of the key held for the layer, e.g. "Tab"; drawn highlighted.
-    pub held: String,
-    /// Pinned apps; `Row::key` is their letter.
+    /// The key held for the layer, e.g. "Tab": the title and the highlighted key.
+    pub prefix: String,
+    /// Pinned apps, drawn as icons; `Row::key` is their letter.
     pub apps: Vec<Row>,
+    /// Text for other keys, by key label.
+    pub labels: HashMap<String, String>,
 }
 
 impl Keyboard {
@@ -97,6 +100,13 @@ impl Keyboard {
             return None;
         };
         self.apps.iter().find(|r| r.key == c)
+    }
+
+    fn label(&self, key: &str) -> Option<&str> {
+        self.labels
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.as_str())
     }
 
     /// Icons in the order `paint` draws the keys.
@@ -140,7 +150,7 @@ pub fn paint(
     scale: f64,
 ) {
     let layout = |text: &str, px: f64, bold: bool| text_layout(cr, font, text, px, bold);
-    let l = layout(&kb.title, 15.0, true);
+    let l = layout(&format!("{} + …", kb.prefix), 15.0, true);
     t.on_surface.set(cr);
     cr.move_to(PAD, PAD + 2.0);
     pangocairo::functions::show_layout(cr, &l);
@@ -148,11 +158,13 @@ pub fn paint(
     let h = UNIT - GAP;
     for ((label, x, y, w), icon) in keys().zip(icons) {
         let app = kb.app(label);
-        let held = label.eq_ignore_ascii_case(&kb.held);
+        let bound = kb.label(label);
+        let used = app.is_some() || bound.is_some();
+        let held = label.eq_ignore_ascii_case(&kb.prefix);
         rounded(cr, x, y, w, h, 7.0);
-        match (held, app) {
+        match (held, used) {
             (true, _) => t.primary.alpha(0.30),
-            (_, Some(_)) => t.primary.alpha(0.12),
+            (_, true) => t.primary.alpha(0.12),
             _ => t.on_surface.alpha(0.04),
         }
         .set(cr);
@@ -166,15 +178,25 @@ pub fn paint(
         } else {
             label.to_string()
         };
-        let color = match (held, app) {
+        let color = match (held, used) {
             (true, _) => t.primary,
-            (_, Some(_)) => t.on_surface,
+            (_, true) => t.on_surface,
             _ => t.on_surface_variant,
         };
         let l = layout(&text, 10.5, held);
         color.set(cr);
         cr.move_to(x + 5.0, y + 3.0);
         pangocairo::functions::show_layout(cr, &l);
+
+        if let Some(bound) = bound {
+            let l = layout(bound, 11.5, true);
+            l.set_width(((w - 6.0) * pango::SCALE as f64) as i32);
+            l.set_ellipsize(pango::EllipsizeMode::End);
+            l.set_alignment(pango::Alignment::Center);
+            t.primary.set(cr);
+            cr.move_to(x + 3.0, y + h - l.pixel_size().1 as f64 - 5.0);
+            pangocairo::functions::show_layout(cr, &l);
+        }
 
         if let (Some(app), Some(img)) = (app, icon) {
             let alpha = if app.running { 1.0 } else { 0.55 };
