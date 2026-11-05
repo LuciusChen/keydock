@@ -1,0 +1,8 @@
+# Keys separated by spaces; "label:width" sets a width in key units and "_:width" is a gap.
+rows = [
+  "` 1 2 3 4 5 6 7 8 9 0 - = Bksp:2",
+  "Tab:1.5 q w e r t y u i o p [ ] \\:1.5",
+  "Caps:1.75 a s d f g h j k l ; ' Enter:2.25",
+  "Shift:2.25 z x c v b n m , . / Shift:2.75",
+  "Ctrl Super Alt Space:5 Alt Print Ctrl Left Up Down Right",
+]

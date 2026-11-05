@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use smithay_client_toolkit::compositor::CompositorState;
+use smithay_client_toolkit::compositor::{CompositorState, Region};
 use smithay_client_toolkit::dispatch2::Dispatch2;
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::{
@@ -31,50 +31,6 @@ pub enum Mode {
     Assign(char),
     /// The trigger key is held: show the keyboard without taking key input.
     Peek,
-}
-
-pub enum View {
-    List(Content),
-    Keyboard(Keyboard),
-}
-
-impl View {
-    /// Icon paths in drawing order, and their size in logical pixels.
-    fn icons(&self) -> (Vec<Option<PathBuf>>, f64) {
-        match self {
-            View::List(c) => (
-                c.sections
-                    .iter()
-                    .flat_map(|s| s.rows.iter())
-                    .map(|r| r.icon.clone())
-                    .collect(),
-                ICON,
-            ),
-            View::Keyboard(kb) => (kb.icon_paths(), keyboard::ICON),
-        }
-    }
-}
-
-pub struct Row {
-    pub key: char,
-    pub name: String,
-    pub icon: Option<PathBuf>,
-    pub running: bool,
-    /// Number keys only work inside the overlay; letters are global.
-    pub temporary: bool,
-}
-
-pub struct Section {
-    pub title: String,
-    pub rows: Vec<Row>,
-}
-
-pub struct Content {
-    pub title: Option<String>,
-    pub sections: Vec<Section>,
-    pub hint: String,
-    /// Shown in a section without rows.
-    pub empty: String,
 }
 
 #[derive(Clone, Copy)]
@@ -140,18 +96,6 @@ impl Theme {
     }
 }
 
-// Logical-pixel metrics.
-const PAD: f64 = 16.0;
-const ROW_H: f64 = 34.0;
-const BADGE: f64 = 24.0;
-const ICON: f64 = 22.0;
-const GAP: f64 = 10.0;
-const SECTION_H: f64 = 26.0;
-const TITLE_H: f64 = 30.0;
-const HINT_H: f64 = 26.0;
-const MIN_W: f64 = 300.0;
-const MAX_NAME_W: f64 = 360.0;
-
 /// Globals the overlay needs; fractional scaling is optional.
 pub struct Globals {
     pub compositor: CompositorState,
@@ -163,7 +107,7 @@ pub struct Globals {
 pub struct Overlay {
     globals: Globals,
     pub mode: Option<Mode>,
-    view: Option<View>,
+    keyboard: Option<Keyboard>,
     layer: Option<LayerSurface>,
     fractional: Option<WpFractionalScaleV1>,
     viewport: Option<WpViewport>,
@@ -171,6 +115,8 @@ pub struct Overlay {
     scale120: u32,
     size: (u32, u32),
     configured: bool,
+    /// Compositors may repeat a configure; only new content needs drawing.
+    stale: bool,
     pool: Option<SlotPool>,
     icons: HashMap<(PathBuf, i32), Option<cairo::ImageSurface>>,
     font: String,
@@ -182,13 +128,14 @@ impl Overlay {
         Overlay {
             globals,
             mode: None,
-            view: None,
+            keyboard: None,
             layer: None,
             fractional: None,
             viewport: None,
             scale120: 120,
             size: (0, 0),
             configured: false,
+            stale: false,
             pool: None,
             icons: HashMap::new(),
             font: "sans".into(),
@@ -206,18 +153,12 @@ impl Overlay {
             .is_some_and(|l| l.wl_surface() == surface)
     }
 
-    /// Shows `view`, or replaces what an open overlay shows.
-    pub fn open(&mut self, qh: &QueueHandle<State>, mode: Mode, view: View, cfg: &Config) {
+    /// Shows `keyboard`, or replaces what an open overlay shows.
+    pub fn open(&mut self, qh: &QueueHandle<State>, mode: Mode, keyboard: Keyboard, cfg: &Config) {
         self.theme = Theme::load();
-        // The keyboard is read at a glance over any window, so it stays opaque.
-        if !matches!(mode, Mode::Peek) {
-            self.theme.surface = self.theme.surface.alpha(cfg.opacity());
-        }
+        self.theme.surface = self.theme.surface.alpha(cfg.opacity());
         self.font = cfg.font.as_deref().unwrap_or("sans").to_string();
-        let (w, h) = match &view {
-            View::List(content) => self.measure(content),
-            View::Keyboard(kb) => kb.size(),
-        };
+        let (w, h) = keyboard.size();
         let (w, h) = (w.ceil() as u32, h.ceil() as u32);
         // A peek only shows; keys keep going to the focused window.
         let input = match mode {
@@ -225,7 +166,8 @@ impl Overlay {
             _ => KeyboardInteractivity::Exclusive,
         };
         self.size = (w, h);
-        self.view = Some(view);
+        self.keyboard = Some(keyboard);
+        self.stale = true;
         self.mode = Some(mode);
         if let Some(layer) = &self.layer {
             layer.set_keyboard_interactivity(input);
@@ -239,6 +181,14 @@ impl Overlay {
             g.layer_shell
                 .create_layer_surface(qh, surface, Layer::Overlay, Some("keydock"), None);
         layer.set_keyboard_interactivity(input);
+        // A peek lets clicks through as well as keys.
+        if matches!(self.mode, Some(Mode::Peek))
+            && let Ok(region) = Region::new(&g.compositor)
+        {
+            layer
+                .wl_surface()
+                .set_input_region(Some(region.wl_region()));
+        }
         layer.set_anchor(Anchor::empty());
         layer.set_size(w, h);
         if let (Some(f), Some(v)) = (&g.fractional, &g.viewporter) {
@@ -259,12 +209,14 @@ impl Overlay {
         }
         self.layer = None; // dropping destroys the layer surface
         self.mode = None;
-        self.view = None;
+        self.keyboard = None;
     }
 
     pub fn configured(&mut self, shm: &Shm) {
         self.configured = true;
-        self.draw(shm);
+        if self.stale {
+            self.draw(shm);
+        }
     }
 
     pub fn set_scale(&mut self, scale120: u32, shm: &Shm) {
@@ -276,32 +228,9 @@ impl Overlay {
         }
     }
 
-    fn measure(&self, content: &Content) -> (f64, f64) {
-        let surface =
-            cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).expect("cairo surface");
-        let cr = cairo::Context::new(&surface).expect("cairo context");
-        let text_w = |t: &str, px: f64, bold: bool| {
-            text_layout(&cr, &self.font, t, px, bold).pixel_size().0 as f64
-        };
-        let mut name_w: f64 = 0.0;
-        let mut h = PAD * 2.0 + HINT_H;
-        let mut other_w = text_w(&content.hint, 11.5, false);
-        if let Some(title) = &content.title {
-            h += TITLE_H;
-            other_w = other_w.max(text_w(title, 15.0, true));
-        }
-        for s in &content.sections {
-            h += SECTION_H + ROW_H * s.rows.len().max(1) as f64;
-            for r in &s.rows {
-                name_w = name_w.max(text_w(&r.name, 13.5, false).min(MAX_NAME_W));
-            }
-        }
-        let row_w = BADGE + GAP + ICON + GAP + name_w + GAP * 2.0 + 6.0;
-        ((PAD * 2.0 + row_w.max(other_w)).max(MIN_W), h)
-    }
-
     fn draw(&mut self, shm: &Shm) {
-        let Some(view) = self.view.as_ref() else {
+        self.stale = false;
+        let Some(keyboard) = self.keyboard.as_ref() else {
             return;
         };
         if self.layer.is_none() {
@@ -321,8 +250,8 @@ impl Overlay {
         );
         let stride = bw * 4;
 
-        let (paths, icon_size) = view.icons();
-        let px = (scale * icon_size).round() as i32;
+        let paths = keyboard.icon_paths();
+        let px = (scale * keyboard::ICON).round() as i32;
         let icons: Vec<Option<cairo::ImageSurface>> = paths
             .into_iter()
             .map(|p| p.and_then(|p| self.icon(&p, px)))
@@ -333,16 +262,9 @@ impl Overlay {
         {
             let cr = cairo::Context::new(&image).expect("cairo context");
             cr.scale(scale, scale);
-            let size = (w as f64, h as f64);
-            card(&cr, &self.theme, size);
-            match self.view.as_ref().expect("view") {
-                View::List(content) => {
-                    paint(&cr, &self.theme, &self.font, content, size, &icons, scale)
-                }
-                View::Keyboard(kb) => {
-                    keyboard::paint(&cr, &self.theme, &self.font, kb, &icons, scale)
-                }
-            }
+            card(&cr, &self.theme, (w as f64, h as f64));
+            let keyboard = self.keyboard.as_ref().expect("keyboard");
+            keyboard::paint(&cr, &self.theme, &self.font, keyboard, &icons, scale);
         }
         image.flush();
         let src_stride = image.stride() as usize;
@@ -391,93 +313,6 @@ fn card(cr: &cairo::Context, t: &Theme, (w, h): (f64, f64)) {
     t.outline.alpha(0.35).set(cr);
     cr.set_line_width(1.0);
     cr.stroke().ok();
-}
-
-fn paint(
-    cr: &cairo::Context,
-    t: &Theme,
-    font: &str,
-    c: &Content,
-    (w, _h): (f64, f64),
-    icons: &[Option<cairo::ImageSurface>],
-    scale: f64,
-) {
-    let layout = |text: &str, px: f64, bold: bool| text_layout(cr, font, text, px, bold);
-    let mut y = PAD;
-    let text = |l: &pango::Layout, x: f64, y: f64, color: Rgba| {
-        color.set(cr);
-        cr.move_to(x, y);
-        pangocairo::functions::show_layout(cr, l);
-    };
-    if let Some(title) = &c.title {
-        let l = layout(title, 15.0, true);
-        text(&l, PAD, y + 2.0, t.on_surface);
-        y += TITLE_H;
-    }
-    let mut icon_i = 0;
-    for s in &c.sections {
-        let l = layout(&s.title, 11.5, true);
-        text(&l, PAD + 2.0, y + 6.0, t.on_surface_variant);
-        y += SECTION_H;
-        if s.rows.is_empty() {
-            let l = layout(&c.empty, 13.0, false);
-            text(
-                &l,
-                PAD + 2.0,
-                y + (ROW_H - l.pixel_size().1 as f64) / 2.0,
-                t.on_surface_variant.alpha(0.7),
-            );
-            y += ROW_H;
-        }
-        for r in &s.rows {
-            let mid = y + ROW_H / 2.0;
-            // Key badge: accent for pinned letters, neutral for temporary numbers.
-            rounded(cr, PAD, mid - BADGE / 2.0, BADGE, BADGE, 7.0);
-            if r.temporary {
-                t.on_surface.alpha(0.10)
-            } else {
-                t.primary.alpha(0.20)
-            }
-            .set(cr);
-            cr.fill().ok();
-            let key = r.key.to_ascii_uppercase().to_string();
-            let l = layout(&key, 13.0, true);
-            let (kw, kh) = l.pixel_size();
-            text(
-                &l,
-                PAD + (BADGE - kw as f64) / 2.0,
-                mid - kh as f64 / 2.0,
-                if r.temporary { t.on_surface } else { t.primary },
-            );
-
-            let x_icon = PAD + BADGE + GAP;
-            if let Some(Some(img)) = icons.get(icon_i) {
-                let alpha = if r.running { 1.0 } else { 0.55 };
-                draw_icon(cr, img, x_icon, mid - ICON / 2.0, scale, alpha);
-            }
-            icon_i += 1;
-
-            let l = layout(&r.name, 13.5, false);
-            l.set_width((MAX_NAME_W * pango::SCALE as f64) as i32);
-            l.set_ellipsize(pango::EllipsizeMode::End);
-            let nh = l.pixel_size().1 as f64;
-            let color = if r.running {
-                t.on_surface
-            } else {
-                t.on_surface_variant.alpha(0.8)
-            };
-            text(&l, x_icon + ICON + GAP, mid - nh / 2.0, color);
-
-            if r.running {
-                t.primary.set(cr);
-                cr.arc(w - PAD - 3.0, mid, 3.0, 0.0, std::f64::consts::TAU);
-                cr.fill().ok();
-            }
-            y += ROW_H;
-        }
-    }
-    let l = layout(&c.hint, 11.5, false);
-    text(&l, PAD + 2.0, y + 8.0, t.on_surface_variant.alpha(0.85));
 }
 
 /// Draws an icon rendered at device pixels with its top-left at (x, y).

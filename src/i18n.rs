@@ -1,9 +1,6 @@
 //! The session language: overlay text and the desktop-entry names to prefer.
 
 pub struct Strings {
-    pub pinned: &'static str,
-    pub open: &'static str,
-    pub none: &'static str,
     pub browse_hint: &'static str,
     /// "{key}" is replaced by the chord, e.g. "Super+E".
     pub unassigned: &'static str,
@@ -14,9 +11,6 @@ pub struct Strings {
 }
 
 const EN: Strings = Strings {
-    pinned: "Pinned",
-    open: "Open",
-    none: "None",
     browse_hint: "Press a letter or number to switch · Esc to close",
     unassigned: "{key} has no app yet",
     assign_section: "Press a number to pin that app to this key",
@@ -25,9 +19,6 @@ const EN: Strings = Strings {
 };
 
 const ZH_CN: Strings = Strings {
-    pinned: "已固定",
-    open: "已打开",
-    none: "（无）",
     browse_hint: "按字母或数字切换 · Esc 关闭",
     unassigned: "{key} 还没有绑定应用",
     assign_section: "按数字把它绑定到这个按键",
@@ -36,9 +27,6 @@ const ZH_CN: Strings = Strings {
 };
 
 const ZH_TW: Strings = Strings {
-    pinned: "已固定",
-    open: "已開啟",
-    none: "（無）",
     browse_hint: "按字母或數字切換 · Esc 關閉",
     unassigned: "{key} 尚未綁定應用程式",
     assign_section: "按數字把它綁定到這個按鍵",
@@ -113,8 +101,17 @@ mod tests {
 
     #[test]
     fn picks_first_supported_language() {
-        assert_eq!(strings(&langs("fr:zh_CN", "en_US.UTF-8")).open, ZH_CN.open);
-        assert_eq!(strings(&langs("", "zh_HK.UTF-8")).open, ZH_TW.open);
-        assert_eq!(strings(&langs("", "de_DE.UTF-8")).open, EN.open);
+        assert_eq!(
+            strings(&langs("fr:zh_CN", "en_US.UTF-8")).browse_hint,
+            ZH_CN.browse_hint
+        );
+        assert_eq!(
+            strings(&langs("", "zh_HK.UTF-8")).browse_hint,
+            ZH_TW.browse_hint
+        );
+        assert_eq!(
+            strings(&langs("", "de_DE.UTF-8")).browse_hint,
+            EN.browse_hint
+        );
     }
 }

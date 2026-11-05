@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -29,6 +30,39 @@ pub struct Layer {
     pub prefix: String,
     /// Text for each key of the keyboard, e.g. h = "←".
     pub keys: HashMap<String, String>,
+    /// The same text in other languages, by language such as "zh_CN" or "zh".
+    #[serde(default)]
+    pub translations: HashMap<String, HashMap<String, String>>,
+}
+
+impl Layer {
+    /// The key text for the first of `languages` it is translated to; a
+    /// translation may cover only some keys.
+    pub fn labels(&self, languages: &[String]) -> HashMap<String, String> {
+        let translation = languages.iter().find_map(|lang| {
+            let primary = lang.split('_').next().unwrap_or(lang);
+            self.translations
+                .get(lang)
+                .or_else(|| self.translations.get(primary))
+        });
+        let mut labels = self.keys.clone();
+        labels.extend(
+            translation
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        labels
+    }
+}
+
+/// Which layout to draw when an input device is connected.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyboardRule {
+    /// Part of the device name, ignoring case.
+    pub device: String,
+    pub layout: String,
 }
 
 /// Exact match, or a versioned id such as "emacs-32-0-50" for "emacs".
@@ -67,6 +101,12 @@ pub struct Config {
     key_label: Option<String>,
     /// Chord that makes the compositor warp the pointer; empty disables it.
     warp: Option<String>,
+    /// Keyboard layout to draw when no `keyboard` rule matches.
+    layout: Option<String>,
+    /// How long the trigger key is held before the peek shows.
+    peek_delay_ms: Option<u64>,
+    #[serde(default, rename = "keyboard")]
+    keyboards: Vec<KeyboardRule>,
     #[serde(default, rename = "app")]
     pub apps: Vec<AppEntry>,
     #[serde(default, rename = "layer")]
@@ -111,6 +151,14 @@ impl Config {
             }
             seen.push(key);
         }
+        for (i, layer) in cfg.layers.iter().enumerate() {
+            if layer.name == "off" {
+                return Err("a layer cannot be named off".into());
+            }
+            if cfg.layers[..i].iter().any(|l| l.name == layer.name) {
+                return Err(format!("layer {} is defined more than once", layer.name));
+            }
+        }
         Ok(cfg)
     }
 
@@ -130,6 +178,23 @@ impl Config {
 
     pub fn by_key(&self, key: char) -> Option<&AppEntry> {
         self.apps.iter().find(|a| a.key.eq_ignore_ascii_case(&key))
+    }
+
+    pub fn peek_delay(&self) -> Duration {
+        Duration::from_millis(self.peek_delay_ms.unwrap_or(400))
+    }
+
+    /// The layout of the first rule matching a device, else the default one.
+    pub fn layout_name(&self, devices: &[String]) -> &str {
+        self.keyboards
+            .iter()
+            .find(|rule| {
+                let wanted = rule.device.to_lowercase();
+                devices.iter().any(|d| d.to_lowercase().contains(&wanted))
+            })
+            .map(|rule| rule.layout.as_str())
+            .or(self.layout.as_deref())
+            .unwrap_or("ansi")
     }
 
     pub fn layer(&self, name: &str) -> Option<&Layer> {
@@ -170,6 +235,59 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labels_follow_the_language() {
+        let cfg = Config::parse(
+            r#"
+            [[layer]]
+            name = "super"
+            prefix = "Super"
+            [layer.keys]
+            q = "Close"
+            f = "Fullscreen"
+            [layer.translations.zh]
+            q = "关闭"
+            [layer.translations.zh_TW]
+            q = "關閉"
+            "#,
+        )
+        .unwrap();
+        let layer = cfg.layer("super").unwrap();
+        let q = |langs: &[&str]| {
+            let langs: Vec<String> = langs.iter().map(|l| l.to_string()).collect();
+            layer.labels(&langs)["q"].clone()
+        };
+        assert_eq!(q(&["de_DE"]), "Close");
+        assert_eq!(q(&["zh_CN"]), "关闭");
+        assert_eq!(q(&["zh_TW"]), "關閉");
+        assert_eq!(q(&["fr", "zh_CN"]), "关闭");
+        assert_eq!(layer.labels(&["zh_CN".into()])["f"], "Fullscreen");
+    }
+
+    #[test]
+    fn picks_the_layout_of_a_connected_device() {
+        let cfg = Config::parse(
+            r#"
+            layout = "mine"
+            [[keyboard]]
+            device = "corne"
+            layout = "corne"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.layout_name(&["foostan Corne v4".into()]), "corne");
+        assert_eq!(cfg.layout_name(&["AT keyboard".into()]), "mine");
+        assert_eq!(Config::default().layout_name(&[]), "ansi");
+    }
+
+    #[test]
+    fn rejects_bad_layers() {
+        let layer =
+            |name: &str| format!("[[layer]]\nname = \"{name}\"\nprefix = \"x\"\nkeys = {{}}\n");
+        assert!(Config::parse(&layer("off")).is_err());
+        assert!(Config::parse(&(layer("a") + &layer("a"))).is_err());
+    }
 
     #[test]
     fn finds_layers_by_name() {

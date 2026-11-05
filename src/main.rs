@@ -7,6 +7,7 @@ mod config;
 mod desktop;
 mod i18n;
 mod keyboard;
+mod layout;
 mod overlay;
 mod tracker;
 mod tray;
@@ -47,8 +48,9 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_m
 
 use config::Config;
 use desktop::{DesktopIndex, IconFinder};
-use keyboard::Keyboard;
-use overlay::{Content, Mode, Overlay, Row, Section, View};
+use keyboard::{Keyboard, Row};
+use layout::Layout;
+use overlay::{Mode, Overlay};
 use tracker::MinimizeCheck;
 use windows::Windows;
 
@@ -57,12 +59,18 @@ const USAGE: &str = "usage: keydock <command>
   daemon        run the background service (started automatically)
   key <letter>  focus, hide or launch the app pinned to <letter>;
                 an unpinned letter opens the overlay to pin an open app
-  overlay       show or hide the overlay of pinned and open apps
+  key <1-9>     focus that open, unpinned app, numbered as the overlay shows
+  overlay       show or hide the keyboard of pinned and open apps
   peek [layer]  a layer's key is held: show the layer on a keyboard after a
                 moment, until \"peek off\" or the next app key; without a
                 layer, shows the pinned apps
   status        list tracked windows, most recently used first
   reload        re-read desktop entries and icons";
+
+/// How long a key may beat the peek it ended, see `State::peek_later`.
+const PEEK_RACE: Duration = Duration::from_millis(150);
+/// The longest a peek stays up.
+const PEEK_MAX: Duration = Duration::from_secs(30);
 
 fn socket_path() -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
@@ -94,6 +102,11 @@ fn main() {
 fn client(line: &str) -> i32 {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path);
+    // A peek is only a hint, and a remapper may send one on every key press:
+    // without a daemon there is nothing to show, so do not start one for it.
+    if stream.is_err() && line.starts_with("peek") {
+        return 0;
+    }
     if stream.is_err() {
         let exe = std::env::current_exe().unwrap_or_else(|_| "keydock".into());
         let _ = std::process::Command::new("setsid")
@@ -149,8 +162,10 @@ impl Request {
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
             ["key", k] => match k.chars().collect::<Vec<_>>().as_slice() {
-                [c] if c.is_ascii_alphabetic() => Ok(Request::Key(c.to_ascii_lowercase())),
-                _ => Err(format!("not a letter: {k}")),
+                [c] if c.is_ascii_alphabetic() || ('1'..='9').contains(c) => {
+                    Ok(Request::Key(c.to_ascii_lowercase()))
+                }
+                _ => Err(format!("not a letter or number: {k}")),
             },
             ["overlay"] => Ok(Request::Overlay),
             ["peek"] => Ok(Request::Peek(None)),
@@ -179,6 +194,8 @@ pub struct State {
     overlay_serial: u64,
     /// Counts peek presses, releases and keys, so a pending peek skips stale ones.
     peek_serial: u64,
+    /// When a key or release last ended a peek.
+    peek_ended: Option<Instant>,
     desktop: DesktopIndex,
     desktop_loaded: Instant,
     icons: IconFinder,
@@ -226,6 +243,7 @@ fn daemon() -> Result<(), String> {
         overlay_targets: Vec::new(),
         overlay_serial: 0,
         peek_serial: 0,
+        peek_ended: None,
         desktop: DesktopIndex::load(),
         desktop_loaded: Instant::now(),
         icons: IconFinder::new(),
@@ -281,8 +299,15 @@ impl State {
     fn command(&mut self, line: &str) -> Result<String, String> {
         match Request::parse(line)? {
             Request::Key(key) => self.key(key)?,
-            Request::Overlay if self.overlay.is_open() => self.overlay.close(),
-            Request::Overlay => self.open_overlay(Mode::Browse)?,
+            Request::Overlay => {
+                // A peek gives way to the overlay; the overlay itself toggles.
+                let toggle_off = matches!(self.overlay.mode, Some(Mode::Browse | Mode::Assign(_)));
+                self.end_peek();
+                self.overlay.close();
+                if !toggle_off {
+                    self.open_browse()?;
+                }
+            }
             Request::Peek(layer) => self.peek_later(layer)?,
             Request::PeekOff => self.end_peek(),
             Request::Status => return Ok(self.status()),
@@ -293,10 +318,17 @@ impl State {
 
     fn key(&mut self, key: char) -> Result<(), String> {
         let cfg = Config::load()?;
-        self.peek_serial += 1;
+        self.end_peek();
         self.overlay.close();
+        if let Some(digit) = key.to_digit(10) {
+            let Some(app_id) = self.unpinned(&cfg).into_iter().nth(digit as usize - 1) else {
+                return Ok(());
+            };
+            let actions = self.windows.tracker.show(&app_id, None)?;
+            return self.windows.run(&self.qh, &actions, cfg.warp());
+        }
         let Some(app) = cfg.by_key(key) else {
-            return self.open_overlay(Mode::Assign(key));
+            return self.open_assign(key);
         };
         let (actions, check) =
             self.windows
@@ -367,7 +399,7 @@ impl State {
         out
     }
 
-    fn row(&mut self, key: char, app_id: &str, name: Option<&str>, temporary: bool) -> Row {
+    fn row(&mut self, key: char, app_id: &str, name: Option<&str>) -> Row {
         let entry = self.desktop.lookup(app_id).cloned();
         let icon = entry
             .as_ref()
@@ -383,7 +415,6 @@ impl State {
             name,
             icon,
             running,
-            temporary,
         }
     }
 
@@ -396,18 +427,24 @@ impl State {
     /// Shows the keyboard if the trigger key is still held after a moment, so
     /// a quick trigger+letter switches apps without it flashing up.
     fn peek_later(&mut self, layer: Option<String>) -> Result<(), String> {
+        // A remapper starts commands at once, so the key that ended this peek
+        // can arrive first.
+        if self.peek_ended.is_some_and(|t| t.elapsed() < PEEK_RACE) {
+            return Ok(());
+        }
+        let cfg = Config::load()?;
         if let Some(name) = &layer {
-            Config::load()?
-                .layer(name)
-                .ok_or(format!("no layer named {name}"))?;
+            cfg.layer(name).ok_or(format!("no layer named {name}"))?;
         }
         self.peek_serial += 1;
         let serial = self.peek_serial;
-        let delay = Duration::from_millis(400);
+        let delay = cfg.peek_delay();
         let _ = self
             .event_loop
             .insert_source(Timer::from_duration(delay), move |_, _, state| {
-                if state.peek_serial == serial && !state.overlay.is_open() {
+                // A peek replaces another peek, but not an overlay taking keys.
+                let free = matches!(state.overlay.mode, None | Some(Mode::Peek));
+                if state.peek_serial == serial && free {
                     if let Err(e) = state.open_peek(layer.as_deref()) {
                         eprintln!("keydock: {e}");
                     }
@@ -420,110 +457,118 @@ impl State {
 
     fn end_peek(&mut self) {
         self.peek_serial += 1;
+        self.peek_ended = Some(Instant::now());
         if matches!(self.overlay.mode, Some(Mode::Peek)) {
             self.overlay.close();
         }
     }
 
-    fn open_peek(&mut self, layer: Option<&str>) -> Result<(), String> {
-        let cfg = Config::load()?;
-        let keyboard = match layer {
-            Some(name) => {
-                let layer = cfg.layer(name).ok_or(format!("no layer named {name}"))?;
-                Keyboard {
-                    prefix: layer.prefix.clone(),
-                    apps: Vec::new(),
-                    labels: layer.keys.clone(),
-                }
-            }
-            None => {
-                self.refresh_desktop();
-                Keyboard {
-                    prefix: cfg.key_label().to_string(),
-                    apps: cfg
-                        .apps
-                        .iter()
-                        .map(|a| self.row(a.key, &a.app_id, a.name.as_deref(), false))
-                        .collect(),
-                    labels: HashMap::new(),
-                }
-            }
+    /// The pinned apps on their letters and `targets` on the number keys.
+    fn app_rows(&mut self, cfg: &Config, targets: &[String]) -> Vec<Row> {
+        let mut rows: Vec<Row> = cfg
+            .apps
+            .iter()
+            .map(|a| self.row(a.key, &a.app_id, a.name.as_deref()))
+            .collect();
+        rows.extend(self.numbered_rows(targets));
+        rows
+    }
+
+    /// The open, unpinned apps on the number keys.
+    fn numbered_rows(&mut self, targets: &[String]) -> Vec<Row> {
+        targets
+            .iter()
+            .enumerate()
+            .map(|(i, id)| self.row(char::from(b'1' + i as u8), id, None))
+            .collect()
+    }
+
+    fn open_keyboard(
+        &mut self,
+        mode: Mode,
+        title: String,
+        prefix: String,
+        apps: Vec<Row>,
+        labels: HashMap<String, String>,
+        cfg: &Config,
+    ) -> Result<(), String> {
+        let keyboard = Keyboard {
+            layout: Layout::load(cfg.layout_name(&layout::device_names()))?,
+            title,
+            prefix,
+            apps,
+            labels,
         };
-        let view = View::Keyboard(keyboard);
-        self.overlay.open(&self.qh, Mode::Peek, view, &cfg);
+        self.overlay_serial += 1;
+        self.overlay.open(&self.qh, mode, keyboard, cfg);
         Ok(())
     }
 
-    fn open_overlay(&mut self, mode: Mode) -> Result<(), String> {
+    fn open_peek(&mut self, layer: Option<&str>) -> Result<(), String> {
+        let cfg = Config::load()?;
+        let (prefix, apps, labels) = match layer {
+            Some(name) => {
+                let layer = cfg.layer(name).ok_or(format!("no layer named {name}"))?;
+                let labels = layer.labels(&i18n::languages());
+                (layer.prefix.clone(), Vec::new(), labels)
+            }
+            None => {
+                self.refresh_desktop();
+                let targets = self.unpinned(&cfg);
+                let apps = self.app_rows(&cfg, &targets);
+                (cfg.key_label().to_string(), apps, HashMap::new())
+            }
+        };
+        let title = format!("{prefix} + …");
+        self.open_keyboard(Mode::Peek, title, prefix, apps, labels, &cfg)?;
+        // In case the release never arrives, as nothing else can close a peek.
+        self.close_overlay_later(PEEK_MAX);
+        Ok(())
+    }
+
+    /// `keydock overlay`: the keyboard of apps, taking key input until closed.
+    fn open_browse(&mut self) -> Result<(), String> {
         let cfg = Config::load()?;
         self.refresh_desktop();
         let targets = self.unpinned(&cfg);
-        let numbered: Vec<Row> = targets
-            .iter()
-            .enumerate()
-            .map(|(i, id)| self.row(char::from(b'1' + i as u8), id, None, true))
-            .collect();
-        let text = i18n::strings(&i18n::languages());
-        // An unpinned key with nothing to pin: say so and close on its own.
-        let nothing_to_pin = matches!(mode, Mode::Assign(_)) && targets.is_empty();
-        let content = match mode {
-            Mode::Browse => {
-                let pinned: Vec<Row> = cfg
-                    .apps
-                    .iter()
-                    .map(|a| self.row(a.key, &a.app_id, a.name.as_deref(), false))
-                    .collect();
-                Content {
-                    title: None,
-                    sections: vec![
-                        Section {
-                            title: text.pinned.into(),
-                            rows: pinned,
-                        },
-                        Section {
-                            title: text.open.into(),
-                            rows: numbered,
-                        },
-                    ],
-                    hint: text.browse_hint.into(),
-                    empty: text.none.into(),
-                }
-            }
-            Mode::Peek => unreachable!("peeks open through open_peek"),
-            Mode::Assign(k) => Content {
-                title: Some(text.unassigned.replace(
-                    "{key}",
-                    &format!("{}+{}", cfg.key_label(), k.to_ascii_uppercase()),
-                )),
-                sections: if nothing_to_pin {
-                    Vec::new()
-                } else {
-                    vec![Section {
-                        title: text.assign_section.into(),
-                        rows: numbered,
-                    }]
-                },
-                hint: if nothing_to_pin {
-                    text.assign_nothing.into()
-                } else {
-                    text.assign_hint.into()
-                },
-                empty: text.none.into(),
-            },
-        };
+        let apps = self.app_rows(&cfg, &targets);
+        let title = i18n::strings(&i18n::languages()).browse_hint.to_string();
+        let prefix = cfg.key_label().to_string();
         self.overlay_targets = targets;
-        self.overlay_serial += 1;
-        self.overlay.open(&self.qh, mode, View::List(content), &cfg);
+        self.open_keyboard(Mode::Browse, title, prefix, apps, HashMap::new(), &cfg)
+    }
+
+    /// An unpinned letter: the open apps on the number keys, to pin one to it.
+    fn open_assign(&mut self, key: char) -> Result<(), String> {
+        let cfg = Config::load()?;
+        self.refresh_desktop();
+        let targets = self.unpinned(&cfg);
+        let text = i18n::strings(&i18n::languages());
+        let chord = format!("{}+{}", cfg.key_label(), key.to_ascii_uppercase());
+        let unassigned = text.unassigned.replace("{key}", &chord);
+        // With nothing to pin, say so and close on its own.
+        let nothing_to_pin = targets.is_empty();
+        let title = if nothing_to_pin {
+            format!("{unassigned} · {}", text.assign_nothing)
+        } else {
+            format!(
+                "{unassigned} · {} · {}",
+                text.assign_section, text.assign_hint
+            )
+        };
+        let apps = self.numbered_rows(&targets);
+        let prefix = cfg.key_label().to_string();
+        self.overlay_targets = targets;
+        self.open_keyboard(Mode::Assign(key), title, prefix, apps, HashMap::new(), &cfg)?;
         if nothing_to_pin {
-            self.close_overlay_later();
+            self.close_overlay_later(Duration::from_millis(1500));
         }
         Ok(())
     }
 
     /// Closes the overlay shortly, unless another one opened meanwhile.
-    fn close_overlay_later(&mut self) {
+    fn close_overlay_later(&mut self, delay: Duration) {
         let serial = self.overlay_serial;
-        let delay = Duration::from_millis(1500);
         let _ = self
             .event_loop
             .insert_source(Timer::from_duration(delay), move |_, _, state| {
@@ -774,7 +819,8 @@ mod tests {
             Ok(Request::Peek(Some("numnav".into())))
         );
         assert_eq!(Request::parse("peek off"), Ok(Request::PeekOff));
-        assert!(Request::parse("key 1").is_err());
+        assert_eq!(Request::parse("key 1"), Ok(Request::Key('1')));
+        assert!(Request::parse("key 0").is_err());
         assert!(Request::parse("key ab").is_err());
         assert!(Request::parse("key").is_err());
         assert!(Request::parse("overlay now").is_err());

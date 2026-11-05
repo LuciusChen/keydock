@@ -10,26 +10,29 @@ The examples bind Super+letter; any trigger that runs `keydock key <letter>` wor
 - **Hiding** minimizes the app's windows. Tiling compositors (niri, Hyprland, sway) ignore
   minimize requests; keydock notices on the first hide and switches to focusing the previous
   app instead, like Cmd+Tab. `keydock status` shows which behaviour is in use.
-- **The overlay** (Super+/ in the examples) lists the pinned apps and the open, unpinned apps.
-  Letters and numbers in the overlay switch to an app; Esc closes it.
+- **The overlay** (Super+/ in the examples) shows a keyboard with the pinned apps on their letters
+  and the open, unpinned apps on the numbers. Letters and numbers switch to an app; Esc closes it.
+- **A number** (`keydock key 1`) switches to that open, unpinned app, most recently used first,
+  so the numbers change as you switch apps.
 - **An unpinned letter** opens the overlay so you can pin an open app to that letter;
   with no open app to pin, it says so and closes itself.
-- **Peeking**: when the trigger key is held for a moment, a keyboard shows the app on each
-  letter, and it goes away when the key is released or a letter is pressed. It never takes
-  key input, so letters keep switching apps while it shows. Other layers can be shown the same
+- **Peeking**: when the trigger key is held for a moment, the same keyboard appears, and it goes away when the key is released or a letter is pressed. It takes no key
+  or pointer input, so letters keep switching apps while it shows. Other layers can be shown the same
   way. This needs a trigger that reports both press and release, such as a kanata layer key;
   see [Peeking with kanata](#peeking-with-kanata).
 
 keydock tracks its own most-recently-used window order through
 `wlr-foreign-toplevel-management`, so the behaviour does not depend on compositor internals.
 The overlay is a layer-shell surface drawn with cairo and pango, with fractional scaling.
-Its text follows the session language (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`):
-English, Simplified Chinese and Traditional Chinese are included, with English as the fallback.
+Its text follows the session language (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`) as the daemon
+saw it when it started: English, Simplified Chinese and Traditional Chinese are included, with
+English as the fallback.
 
 ## Commands
 
 ```text
 keydock key <letter>   focus, hide or launch the app pinned to <letter>
+keydock key <1-9>      focus that open, unpinned app
 keydock overlay        show or hide the overlay
 keydock peek [layer]   a layer's key is held: show it on a keyboard after a moment
 keydock peek off       the key is released: hide it
@@ -47,20 +50,56 @@ font = "sans"          # optional overlay font
 hide = "auto"          # auto | minimize | previous (focus the previous app)
 key_label = "Super"    # modifier name shown in the overlay, e.g. "Hyper"
 warp = "super+ctrl+alt+shift+p"  # chord for the compositor's cursor warp; "" disables it
-opacity = 1.0          # overlay background opacity, 0.0 to 1.0; the peek keyboard stays opaque
+opacity = 1.0          # overlay background opacity, 0.0 to 1.0
 
 [[app]]
 key = "c"
 app_id = "kitty"       # as shown by `keydock status`; "emacs" also matches "emacs-32-0-50"
 exec = "kitty"         # launch command when no window exists
 
-[[layer]]              # optional, shown by `keydock peek numnav`
-name = "numnav"
-prefix = ";"           # the key held; highlighted when the keyboard has a key of that name
+```
 
-[layer.keys]           # text for each key
-h = "←"
-n = "Home"
+### Layers
+
+A layer of another tool, shown by `keydock peek <name>`. The text follows the session language,
+and keys without a translation keep the text from `keys`:
+
+```toml
+[[layer]]
+name = "windows"
+prefix = "Super"       # the keys held, e.g. "Super+;"; highlighted when the keyboard has them
+
+[layer.keys]
+q = "Close"
+Left = "Snap left"
+
+[layer.translations.zh_CN]   # or "zh" for every Chinese locale
+q = "关闭"
+```
+
+### Keyboard layouts
+
+The keyboard is `ansi` unless told otherwise; `corne` is also built in. A rule picks a layout
+while a device is connected, matching part of its name in `/proc/bus/input/devices`:
+
+```toml
+layout = "ansi"        # the default
+peek_delay_ms = 400    # how long a key is held before the peek shows
+
+[[keyboard]]
+device = "Corne"
+layout = "corne"
+```
+
+Layouts in `~/.config/keydock/layouts/<name>.toml` add to these or replace them. Each row lists
+its keys; `label:width` sets a width in key units and `_:width` leaves a gap. Layer keys and
+prefixes refer to these labels.
+
+```toml
+rows = [
+  "Tab:1.5 q w e r t _:2 y u i o p",
+  "_:3 Super Space",
+]
 ```
 
 Overlay colors are read from `~/.config/keydock/colors.toml` each time the overlay opens.
@@ -107,6 +146,9 @@ to match, and keep the `warp` chord free of app bindings.
 Start `keydock daemon` from the session autostart. Any other command starts it if needed.
 
 ## Peeking with kanata
+
+A peek that never hears its release closes itself after 30 seconds, and `keydock peek` does nothing
+when the daemon is not running.
 
 A held Tab can be the trigger: its layer sends `keydock key <letter>`, and pressing and
 releasing it send `keydock peek` and `keydock peek off`. Set `key_label = "Tab"` so the
@@ -183,7 +225,8 @@ CI runs the same checks. The code is split so the decisions can be tested withou
 | `src/tray.rs` | Restores an app from its StatusNotifierItem tray icon over D-Bus before launching it. |
 | `src/config.rs` | Loading, validating and appending to `config.toml`. |
 | `src/overlay.rs` | The layer-shell overlay, drawn with cairo and pango. |
-| `src/keyboard.rs` | The peek view: a keyboard showing what each key does in a layer. |
+| `src/keyboard.rs` | Draws a keyboard showing what each key does in a layer. |
+| `src/layout.rs` | Keyboard layouts, built in or from the user's files. |
 | `src/desktop.rs` | Desktop entries and icon-theme lookup. |
 | `src/i18n.rs` | Session language and overlay text. |
 | `src/main.rs` | Command line, the daemon's socket and event loop, and wiring. |

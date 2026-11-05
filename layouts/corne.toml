@@ -1,0 +1,7 @@
+# A 42-key split keyboard; see ansi.toml for the format.
+rows = [
+  "Tab q w e r t _:2 y u i o p Bksp",
+  "Esc a s d f g _:2 h j k l ; '",
+  "Shift z x c v b _:2 n m , . / `",
+  "_:3 Ctrl Super LT1 _:2 LT2 Enter Alt",
+]
