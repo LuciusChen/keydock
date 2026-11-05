@@ -323,10 +323,10 @@ impl State {
     }
 
     /// Whether the open overlay gives the number keys a meaning of its own; a
-    /// peek at a named layer shows none.
+    /// peek at a named layer does not.
     fn numbers_on_screen(&self) -> bool {
         match self.overlay.mode {
-            Some(Mode::Peek) => !self.overlay_targets.is_empty(),
+            Some(Mode::Peek { numbered }) => numbered,
             Some(_) => true,
             None => false,
         }
@@ -466,7 +466,7 @@ impl State {
             .event_loop
             .insert_source(Timer::from_duration(delay), move |_, _, state| {
                 // A peek replaces another peek, but not an overlay taking keys.
-                let free = matches!(state.overlay.mode, None | Some(Mode::Peek));
+                let free = matches!(state.overlay.mode, None | Some(Mode::Peek { .. }));
                 if state.peek_serial == serial && free {
                     if let Err(e) = state.open_peek(layer.as_deref()) {
                         eprintln!("keydock: {e}");
@@ -481,7 +481,7 @@ impl State {
     fn end_peek(&mut self) {
         self.peek_serial += 1;
         self.peek_ended = Some(Instant::now());
-        if matches!(self.overlay.mode, Some(Mode::Peek)) {
+        if matches!(self.overlay.mode, Some(Mode::Peek { .. })) {
             self.overlay.close();
         }
     }
@@ -534,7 +534,8 @@ impl State {
             labels,
         };
         self.overlay_targets = targets;
-        self.show(Mode::Peek, keyboard, &cfg);
+        let numbered = layer.is_none();
+        self.show(Mode::Peek { numbered }, keyboard, &cfg);
         // In case the release never arrives, as nothing else can close a peek.
         self.close_overlay_later(PEEK_MAX);
         Ok(())
@@ -635,7 +636,7 @@ impl State {
                     .map_err(|e| e.to_string())?;
                 (app_id, None)
             }
-            (Some(Mode::Browse | Mode::Peek), Some(app_id)) => (app_id, None),
+            (Some(Mode::Browse | Mode::Peek { .. }), Some(app_id)) => (app_id, None),
             (Some(Mode::Browse), None) => match cfg.by_key(c) {
                 Some(app) => (app.app_id.clone(), app.exec.clone()),
                 None => return Ok(()),

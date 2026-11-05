@@ -58,7 +58,8 @@ pub struct Tracker {
     launching: Vec<(String, Instant)>,
     /// Learned on the first automatic hide: tiling compositors ignore minimize.
     pub minimize_works: Option<bool>,
-    /// The active workspace, on compositors that report it.
+    /// The one active workspace; unknown where it is unreported, or where each
+    /// output has its own, and then keys act on every window.
     workspace: Option<Id>,
     /// The window that kept focus through the last workspace change, and where it was.
     moved: Option<(Id, Option<Id>, Instant)>,
@@ -124,11 +125,23 @@ impl Tracker {
     /// focus stays on the active workspace, so a focused window is there. One
     /// that keeps focus through the change moved along with it, unless it loses
     /// focus right after: focusing a window elsewhere changes the workspace first.
-    pub fn set_workspace(&mut self, workspace: Id) {
-        self.workspace = Some(workspace);
+    pub fn set_workspace(&mut self, workspace: Option<Id>) {
+        if self.workspace == workspace {
+            return;
+        }
+        self.workspace = workspace;
         if let Some(w) = self.list.iter_mut().find(|w| w.activated) {
             self.moved = Some((w.id, w.workspace, Instant::now()));
-            w.workspace = Some(workspace);
+            w.workspace = workspace;
+        }
+    }
+
+    /// Forgets a removed workspace; the compositor moved its windows elsewhere.
+    pub fn remove_workspace(&mut self, workspace: Id) {
+        for w in &mut self.list {
+            if w.workspace == Some(workspace) {
+                w.workspace = None;
+            }
         }
     }
 
@@ -156,6 +169,9 @@ impl Tracker {
                 .filter(|w| w.workspace.is_none() || w.workspace == workspace)
                 .collect()
         };
+        if self.workspace.is_none() {
+            return self.of_app(app_id).collect();
+        }
         let here = on(self.workspace);
         match (here.is_empty(), self.of_app(app_id).next()) {
             (true, Some(latest)) => on(latest.workspace),
@@ -328,10 +344,10 @@ mod tests {
     fn two_workspaces() -> Tracker {
         let mut t = tracker(&[(1, "a", false), (2, "a", false), (3, "b", false)]);
         t.set_state(1, false, false);
-        t.set_workspace(10);
+        t.set_workspace(Some(10));
         t.set_state(1, true, false);
         t.set_state(1, false, false);
-        t.set_workspace(20);
+        t.set_workspace(Some(20));
         t.set_state(2, true, false);
         t.set_state(2, false, false);
         t.set_state(3, true, false);
@@ -348,14 +364,14 @@ mod tests {
     #[test]
     fn a_window_moved_with_focus_follows_the_workspace() {
         let mut t = two_workspaces();
-        t.set_workspace(10);
+        t.set_workspace(Some(10));
         assert_eq!(t.active().unwrap().workspace, Some(10));
     }
 
     #[test]
     fn a_window_losing_focus_right_after_the_change_stays_behind() {
         let mut t = two_workspaces();
-        t.set_workspace(10);
+        t.set_workspace(Some(10));
         t.set_state(3, false, false);
         t.set_state(1, true, false);
         let on = |t: &Tracker, id| t.list.iter().find(|w| w.id == id).unwrap().workspace;
@@ -366,7 +382,7 @@ mod tests {
     #[test]
     fn a_moved_window_stays_moved_when_it_loses_focus_later() {
         let mut t = two_workspaces();
-        t.set_workspace(10);
+        t.set_workspace(Some(10));
         std::thread::sleep(MOVE_GRACE);
         t.set_state(3, false, false);
         let on = t.list.iter().find(|w| w.id == 3).unwrap().workspace;
@@ -382,7 +398,7 @@ mod tests {
     #[test]
     fn show_goes_to_the_app_when_it_is_only_elsewhere() {
         let mut t = two_workspaces();
-        t.set_workspace(30);
+        t.set_workspace(Some(30));
         t.set_state(3, false, false);
         assert_eq!(t.show("a", None).unwrap(), [Activate(2), Warp]);
         t.remove(2);
@@ -396,6 +412,20 @@ mod tests {
         t.set_state(2, true, false);
         let (actions, _) = t.hide("a", Hide::Minimize);
         assert_eq!(actions, [Minimize(2)]);
+    }
+
+    #[test]
+    fn several_active_workspaces_act_on_every_window() {
+        let mut t = two_workspaces();
+        t.set_workspace(None);
+        assert_eq!(t.show("a", None).unwrap(), [Activate(1), Activate(2), Warp]);
+    }
+
+    #[test]
+    fn a_removed_workspace_is_forgotten() {
+        let mut t = two_workspaces();
+        t.remove_workspace(10);
+        assert_eq!(t.show("a", None).unwrap(), [Activate(1), Activate(2), Warp]);
     }
 
     #[test]

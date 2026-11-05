@@ -30,7 +30,8 @@ pub enum Mode {
     /// An unpinned Super+letter: pick an open app to pin to that letter.
     Assign(char),
     /// The trigger key is held: show the keyboard without taking key input.
-    Peek,
+    /// `numbered` says whether its number keys are the open apps, even if none.
+    Peek { numbered: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -159,7 +160,7 @@ impl Overlay {
         let (w, h) = (w.ceil() as u32, h.ceil() as u32);
         // A peek only shows; keys keep going to the focused window.
         let input = match mode {
-            Mode::Peek => KeyboardInteractivity::None,
+            Mode::Peek { .. } => KeyboardInteractivity::None,
             _ => KeyboardInteractivity::Exclusive,
         };
         self.size = (w, h);
@@ -173,7 +174,7 @@ impl Overlay {
                 .create_layer_surface(qh, surface, Layer::Overlay, Some("keydock"), None);
         layer.set_keyboard_interactivity(input);
         // A peek lets clicks through as well as keys.
-        if matches!(self.mode, Some(Mode::Peek))
+        if matches!(self.mode, Some(Mode::Peek { .. }))
             && let Ok(region) = Region::new(&g.compositor)
         {
             layer
