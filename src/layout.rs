@@ -9,6 +9,10 @@ const BUILT_IN: &[(&str, &str)] = &[
     ("corne", include_str!("../layouts/corne.toml")),
 ];
 
+/// More than any keyboard needs, and small enough to always fit a drawing surface.
+const MAX_WIDTH: f64 = 40.0;
+const MAX_ROWS: usize = 12;
+
 pub struct Key {
     pub label: String,
     /// Left edge and width in key units.
@@ -38,21 +42,25 @@ impl Layout {
         Ok(layout)
     }
 
-    /// A layout without number keys, like a 42-key one, gets a row below it, so
+    /// Number keys a layout lacks, as on a 42-key one, go in a row below it, so
     /// apps on the numbers can still be seen and picked.
     fn add_number_row(&mut self, numbers: usize) {
-        if numbers == 0 || self.keys.iter().any(|k| k.label == "1") {
+        let missing: Vec<String> = (1..=numbers)
+            .map(|n| n.to_string())
+            .filter(|n| !self.keys.iter().any(|k| k.label == *n))
+            .collect();
+        if missing.is_empty() {
             return;
         }
-        for i in 0..numbers {
+        self.width = self.width.max(missing.len() as f64);
+        for (i, label) in missing.into_iter().enumerate() {
             self.keys.push(Key {
-                label: (i + 1).to_string(),
+                label,
                 x: i as f64,
                 width: 1.0,
                 row: self.rows,
             });
         }
-        self.width = self.width.max(numbers as f64);
         self.rows += 1;
     }
 
@@ -93,6 +101,11 @@ impl Layout {
         }
         if keys.is_empty() {
             return Err("no keys".into());
+        }
+        if width > MAX_WIDTH || file.rows.len() > MAX_ROWS {
+            return Err(format!(
+                "too large, the limit is {MAX_WIDTH} key units wide and {MAX_ROWS} rows"
+            ));
         }
         Ok(Layout {
             keys,
@@ -159,6 +172,23 @@ mod tests {
         let rows = layout.rows;
         layout.add_number_row(2);
         assert_eq!(layout.rows, rows);
+    }
+
+    #[test]
+    fn adds_only_the_missing_numbers() {
+        let mut layout = Layout::parse(r#"rows = ["1 q w"]"#).unwrap();
+        layout.add_number_row(2);
+        let labels: Vec<_> = layout.keys.iter().map(|k| k.label.as_str()).collect();
+        assert_eq!(labels, ["1", "q", "w", "2"]);
+        assert_eq!(layout.rows, 2);
+    }
+
+    #[test]
+    fn rejects_layouts_too_large_to_draw() {
+        assert!(Layout::parse(r#"rows = ["q:1000"]"#).is_err());
+        assert!(Layout::parse(r#"rows = ["q:inf"]"#).is_err());
+        let rows = vec!["\"q\""; 13].join(",");
+        assert!(Layout::parse(&format!("rows = [{rows}]")).is_err());
     }
 
     #[test]

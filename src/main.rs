@@ -318,9 +318,19 @@ impl State {
         Ok(String::new())
     }
 
+    /// Whether the open overlay gives the number keys a meaning of its own; a
+    /// peek at a named layer shows none.
+    fn numbers_on_screen(&self) -> bool {
+        match self.overlay.mode {
+            Some(Mode::Peek) => !self.overlay_targets.is_empty(),
+            Some(_) => true,
+            None => false,
+        }
+    }
+
     fn key(&mut self, key: char) -> Result<(), String> {
         // A number means what the open overlay shows, and pins in assign mode.
-        if key.is_ascii_digit() && self.overlay.is_open() {
+        if key.is_ascii_digit() && self.numbers_on_screen() {
             let result = self.overlay_choice(key);
             self.end_peek();
             return result;
@@ -498,28 +508,27 @@ impl State {
 
     fn open_peek(&mut self, layer: Option<&str>) -> Result<(), String> {
         let cfg = Config::load()?;
-        let (prefix, apps, labels) = match layer {
+        let (prefix, apps, labels, targets) = match layer {
             Some(name) => {
                 let layer = cfg.layer(name).ok_or(format!("no layer named {name}"))?;
                 let labels = layer.labels(&i18n::languages());
-                self.overlay_targets.clear();
-                (layer.prefix.clone(), Vec::new(), labels)
+                (layer.prefix.clone(), Vec::new(), labels, Vec::new())
             }
             None => {
                 self.refresh_desktop();
                 let targets = self.unpinned(&cfg);
                 let apps = self.all_apps(&cfg, &targets);
-                self.overlay_targets = targets;
-                (cfg.key_label().to_string(), apps, HashMap::new())
+                (cfg.key_label().to_string(), apps, HashMap::new(), targets)
             }
         };
         let keyboard = Keyboard {
-            layout: Layout::current(&cfg, self.overlay_targets.len())?,
+            layout: Layout::current(&cfg, targets.len())?,
             title: format!("{prefix} + …"),
             prefix,
             apps,
             labels,
         };
+        self.overlay_targets = targets;
         self.show(Mode::Peek, keyboard, &cfg);
         // In case the release never arrives, as nothing else can close a peek.
         self.close_overlay_later(PEEK_MAX);
