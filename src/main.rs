@@ -67,8 +67,10 @@ const USAGE: &str = "usage: keydock <command>
   status        list tracked windows, most recently used first
   reload        re-read desktop entries and icons";
 
-/// How long a key may beat the peek it ended, see `State::peek_later`.
-const PEEK_RACE: Duration = Duration::from_millis(150);
+/// How long a key may beat the peek it ended, see `State::peek_later`. Commands
+/// started together arrive within about 15 ms of each other through runuser; a
+/// new peek inside this window loses only its hint.
+const PEEK_RACE: Duration = Duration::from_millis(50);
 /// The longest a peek stays up.
 const PEEK_MAX: Duration = Duration::from_secs(30);
 
@@ -317,6 +319,12 @@ impl State {
     }
 
     fn key(&mut self, key: char) -> Result<(), String> {
+        // A number means what the open overlay shows, and pins in assign mode.
+        if key.is_ascii_digit() && self.overlay.is_open() {
+            let result = self.overlay_choice(key);
+            self.end_peek();
+            return result;
+        }
         let cfg = Config::load()?;
         self.end_peek();
         self.overlay.close();
@@ -494,17 +502,19 @@ impl State {
             Some(name) => {
                 let layer = cfg.layer(name).ok_or(format!("no layer named {name}"))?;
                 let labels = layer.labels(&i18n::languages());
+                self.overlay_targets.clear();
                 (layer.prefix.clone(), Vec::new(), labels)
             }
             None => {
                 self.refresh_desktop();
                 let targets = self.unpinned(&cfg);
                 let apps = self.all_apps(&cfg, &targets);
+                self.overlay_targets = targets;
                 (cfg.key_label().to_string(), apps, HashMap::new())
             }
         };
         let keyboard = Keyboard {
-            layout: Layout::current(&cfg)?,
+            layout: Layout::current(&cfg, self.overlay_targets.len())?,
             title: format!("{prefix} + …"),
             prefix,
             apps,
@@ -522,7 +532,7 @@ impl State {
         self.refresh_desktop();
         let targets = self.unpinned(&cfg);
         let keyboard = Keyboard {
-            layout: Layout::current(&cfg)?,
+            layout: Layout::current(&cfg, targets.len())?,
             title: i18n::strings(&i18n::languages()).browse_hint.to_string(),
             prefix: cfg.key_label().to_string(),
             apps: self.all_apps(&cfg, &targets),
@@ -552,7 +562,7 @@ impl State {
             )
         };
         let keyboard = Keyboard {
-            layout: Layout::current(&cfg)?,
+            layout: Layout::current(&cfg, targets.len())?,
             title,
             prefix: cfg.key_label().to_string(),
             apps: self.numbered_apps(&targets),
@@ -611,7 +621,7 @@ impl State {
                     .map_err(|e| e.to_string())?;
                 (app_id, None)
             }
-            (Some(Mode::Browse), Some(app_id)) => (app_id, None),
+            (Some(Mode::Browse | Mode::Peek), Some(app_id)) => (app_id, None),
             (Some(Mode::Browse), None) => match cfg.by_key(c) {
                 Some(app) => (app.app_id.clone(), app.exec.clone()),
                 None => return Ok(()),

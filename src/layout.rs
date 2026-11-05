@@ -31,9 +31,29 @@ struct File {
 }
 
 impl Layout {
-    /// The layout for the keyboards connected now.
-    pub fn current(cfg: &Config) -> Result<Layout, String> {
-        Self::load(cfg.layout_name(&device_names()))
+    /// The layout for the keyboards connected now, with keys for `numbers` apps.
+    pub fn current(cfg: &Config, numbers: usize) -> Result<Layout, String> {
+        let mut layout = Self::load(cfg.layout_name(&device_names()))?;
+        layout.add_number_row(numbers);
+        Ok(layout)
+    }
+
+    /// A layout without number keys, like a 42-key one, gets a row below it, so
+    /// apps on the numbers can still be seen and picked.
+    fn add_number_row(&mut self, numbers: usize) {
+        if numbers == 0 || self.keys.iter().any(|k| k.label == "1") {
+            return;
+        }
+        for i in 0..numbers {
+            self.keys.push(Key {
+                label: (i + 1).to_string(),
+                x: i as f64,
+                width: 1.0,
+                row: self.rows,
+            });
+        }
+        self.width = self.width.max(numbers as f64);
+        self.rows += 1;
     }
 
     /// The user's layout of that name, else the built-in one.
@@ -123,6 +143,22 @@ mod tests {
             ]
         );
         assert_eq!((layout.width, layout.rows), (5.5, 2));
+    }
+
+    #[test]
+    fn adds_number_keys_only_where_missing() {
+        let mut layout = Layout::load("corne").unwrap();
+        let rows = layout.rows;
+        layout.add_number_row(0);
+        assert_eq!(layout.rows, rows);
+        layout.add_number_row(2);
+        assert_eq!(layout.rows, rows + 1);
+        assert!(layout.keys.iter().any(|k| k.label == "2" && k.row == rows));
+
+        let mut layout = Layout::load("ansi").unwrap();
+        let rows = layout.rows;
+        layout.add_number_row(2);
+        assert_eq!(layout.rows, rows);
     }
 
     #[test]

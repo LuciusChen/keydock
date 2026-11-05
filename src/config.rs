@@ -99,6 +99,9 @@ pub struct Config {
     key_label: Option<String>,
     /// Chord that makes the compositor warp the pointer; empty disables it.
     warp: Option<String>,
+    /// Ignored: the overlay is always opaque now, but older configs still set it.
+    #[serde(rename = "opacity")]
+    _opacity: Option<toml::Value>,
     /// Keyboard layout to draw when no `keyboard` rule matches.
     layout: Option<String>,
     /// How long the trigger key is held before the peek shows.
@@ -312,6 +315,11 @@ mod tests {
         assert_eq!(cfg.hide, Hide::Auto);
         assert_eq!(cfg.key_label(), "Super");
         assert_eq!(cfg.warp(), Some(DEFAULT_WARP));
+    }
+
+    #[test]
+    fn accepts_the_old_opacity_setting() {
+        assert!(Config::parse("opacity = 0.8").is_ok());
     }
 
     #[test]

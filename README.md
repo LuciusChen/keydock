@@ -96,6 +96,7 @@ device = "Corne"
 layout = "corne"
 ```
 
+A layout without number keys gets a row of them below it when open, unpinned apps need one.
 Layouts in `~/.config/keydock/layouts/<name>.toml` add to these or replace them. Each row lists
 its keys; `label:width` sets a width in key units and `_:width` leaves a gap. Layer keys and
 prefixes refer to these labels.

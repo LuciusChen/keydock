@@ -38,7 +38,7 @@ impl Keyboard {
         let (Some(c), None) = (chars.next(), chars.next()) else {
             return None;
         };
-        self.apps.iter().find(|r| r.key == c)
+        self.apps.iter().find(|r| r.key.eq_ignore_ascii_case(&c))
     }
 
     fn is_held(&self, key: &str) -> bool {
@@ -159,6 +159,24 @@ pub fn paint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_apps_ignoring_case() {
+        let kb = Keyboard {
+            layout: Layout::load("ansi").unwrap(),
+            title: String::new(),
+            prefix: String::new(),
+            apps: vec![KeyApp {
+                key: 'C',
+                name: String::new(),
+                icon: None,
+                running: false,
+            }],
+            labels: HashMap::new(),
+        };
+        assert!(kb.app("c").is_some());
+        assert!(kb.app("Ctrl").is_none());
+    }
 
     #[test]
     fn highlights_every_key_of_the_prefix() {
