@@ -1,7 +1,7 @@
 //! The Wayland side of window management: feeds foreign-toplevel events into
 //! the [`Tracker`] and carries out the [`Action`]s it decides on.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::process::{Command, Stdio};
@@ -12,6 +12,11 @@ use smithay_client_toolkit::dispatch2::Dispatch2;
 use wayland_client::backend::ObjectData;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::{Connection, Proxy, QueueHandle};
+use wayland_protocols::ext::workspace::v1::client::{
+    ext_workspace_group_handle_v1::{self as group, ExtWorkspaceGroupHandleV1},
+    ext_workspace_handle_v1::{self as workspace, ExtWorkspaceHandleV1},
+    ext_workspace_manager_v1::{self as workspaces, ExtWorkspaceManagerV1},
+};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
@@ -29,6 +34,7 @@ use crate::tray;
 pub struct Windows {
     pub tracker: Tracker,
     handles: HashMap<Id, ZwlrForeignToplevelHandleV1>,
+    active_workspaces: HashSet<Id>,
     seat: Option<WlSeat>,
     vk_manager: Option<ZwpVirtualKeyboardManagerV1>,
     vk: Option<(ZwpVirtualKeyboardV1, xkb::Keymap)>,
@@ -40,6 +46,7 @@ impl Windows {
         Windows {
             tracker: Tracker::default(),
             handles: HashMap::new(),
+            active_workspaces: HashSet::new(),
             seat: None,
             vk_manager,
             vk: None,
@@ -243,6 +250,88 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for Toplevel {
             handle::Event::Closed => {
                 windows.tracker.remove(id);
                 windows.handles.remove(&id);
+                handle.destroy();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// User data for ext-workspace: only tells the tracker the active workspace,
+/// when there is just one.
+pub struct WorkspaceManager;
+struct WorkspaceGroup;
+struct Workspace;
+
+impl Dispatch2<ExtWorkspaceManagerV1, State> for WorkspaceManager {
+    fn event(
+        &self,
+        state: &mut State,
+        _: &ExtWorkspaceManagerV1,
+        event: workspaces::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let workspaces::Event::Done = event {
+            let windows = &mut state.windows;
+            let active = match windows.active_workspaces.len() {
+                1 => windows.active_workspaces.iter().next().copied(),
+                _ => None,
+            };
+            windows.tracker.set_workspace(active);
+        }
+    }
+
+    fn event_created_child(opcode: u16, qh: &QueueHandle<State>) -> Arc<dyn ObjectData> {
+        match opcode {
+            workspaces::EVT_WORKSPACE_GROUP_OPCODE => {
+                qh.make_data::<ExtWorkspaceGroupHandleV1, _>(WorkspaceGroup)
+            }
+            workspaces::EVT_WORKSPACE_OPCODE => qh.make_data::<ExtWorkspaceHandleV1, _>(Workspace),
+            _ => unreachable!("ext-workspace event {opcode} creates no object"),
+        }
+    }
+}
+
+impl Dispatch2<ExtWorkspaceGroupHandleV1, State> for WorkspaceGroup {
+    fn event(
+        &self,
+        _: &mut State,
+        handle: &ExtWorkspaceGroupHandleV1,
+        event: group::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let group::Event::Removed = event {
+            handle.destroy();
+        }
+    }
+}
+
+impl Dispatch2<ExtWorkspaceHandleV1, State> for Workspace {
+    fn event(
+        &self,
+        state: &mut State,
+        handle: &ExtWorkspaceHandleV1,
+        event: workspace::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        let (id, windows) = (handle.id().protocol_id(), &mut state.windows);
+        match event {
+            workspace::Event::State { state: flags } => {
+                if flags
+                    .into_result()
+                    .is_ok_and(|f| f.contains(workspace::State::Active))
+                {
+                    windows.active_workspaces.insert(id);
+                } else {
+                    windows.active_workspaces.remove(&id);
+                }
+            }
+            workspace::Event::Removed => {
+                windows.active_workspaces.remove(&id);
+                windows.tracker.remove_workspace(id);
                 handle.destroy();
             }
             _ => {}

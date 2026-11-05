@@ -6,11 +6,14 @@
 mod config;
 mod desktop;
 mod i18n;
+mod keyboard;
+mod layout;
 mod overlay;
 mod tracker;
 mod tray;
 mod windows;
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -41,11 +44,14 @@ use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_seat, wl_surface},
 };
+use wayland_protocols::ext::workspace::v1::client::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
 use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
 
 use config::Config;
 use desktop::{DesktopIndex, IconFinder};
-use overlay::{Content, Mode, Overlay, Row, Section};
+use keyboard::{KeyApp, Keyboard};
+use layout::Layout;
+use overlay::{Mode, Overlay};
 use tracker::MinimizeCheck;
 use windows::Windows;
 
@@ -54,9 +60,20 @@ const USAGE: &str = "usage: keydock <command>
   daemon        run the background service (started automatically)
   key <letter>  focus, hide or launch the app pinned to <letter>;
                 an unpinned letter opens the overlay to pin an open app
-  overlay       show or hide the overlay of pinned and open apps
+  key <1-9>     focus that open, unpinned app, numbered as the overlay shows
+  overlay       show or hide the keyboard of pinned and open apps
+  peek [layer]  a layer's key is held: show the layer on a keyboard after a
+                moment, until \"peek off\" or the next app key; without a
+                layer, shows the pinned apps
   status        list tracked windows, most recently used first
   reload        re-read desktop entries and icons";
+
+/// How long a key may beat the peek it ended, see `State::peek_later`. Commands
+/// started together arrive within about 15 ms of each other through runuser; a
+/// new peek inside this window loses only its hint.
+const PEEK_RACE: Duration = Duration::from_millis(50);
+/// The longest a peek stays up.
+const PEEK_MAX: Duration = Duration::from_secs(30);
 
 fn socket_path() -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
@@ -88,6 +105,11 @@ fn main() {
 fn client(line: &str) -> i32 {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path);
+    // A peek is only a hint, and a remapper may send one on every key press:
+    // without a daemon there is nothing to show, so do not start one for it.
+    if stream.is_err() && line.starts_with("peek") {
+        return 0;
+    }
     if stream.is_err() {
         let exe = std::env::current_exe().unwrap_or_else(|_| "keydock".into());
         let _ = std::process::Command::new("setsid")
@@ -131,6 +153,9 @@ fn client(line: &str) -> i32 {
 enum Request {
     Key(char),
     Overlay,
+    /// A layer's key was pressed; `None` is the pinned apps.
+    Peek(Option<String>),
+    PeekOff,
     Status,
     Reload,
 }
@@ -140,10 +165,15 @@ impl Request {
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
             ["key", k] => match k.chars().collect::<Vec<_>>().as_slice() {
-                [c] if c.is_ascii_alphabetic() => Ok(Request::Key(c.to_ascii_lowercase())),
-                _ => Err(format!("not a letter: {k}")),
+                [c] if c.is_ascii_alphabetic() || ('1'..='9').contains(c) => {
+                    Ok(Request::Key(c.to_ascii_lowercase()))
+                }
+                _ => Err(format!("not a letter or number: {k}")),
             },
             ["overlay"] => Ok(Request::Overlay),
+            ["peek"] => Ok(Request::Peek(None)),
+            ["peek", "off"] => Ok(Request::PeekOff),
+            ["peek", layer] => Ok(Request::Peek(Some(layer.to_string()))),
             ["status"] => Ok(Request::Status),
             ["reload"] => Ok(Request::Reload),
             _ => Err(format!("unknown command: {line}\n{USAGE}")),
@@ -165,6 +195,10 @@ pub struct State {
     overlay_targets: Vec<String>,
     /// Counts overlay openings, so a pending auto-close skips a newer overlay.
     overlay_serial: u64,
+    /// Counts peek presses, releases and keys, so a pending peek skips stale ones.
+    peek_serial: u64,
+    /// When a key or release last ended a peek.
+    peek_ended: Option<Instant>,
     desktop: DesktopIndex,
     desktop_loaded: Instant,
     icons: IconFinder,
@@ -181,7 +215,7 @@ fn daemon() -> Result<(), String> {
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
 
     let conn = Connection::connect_to_env().map_err(|e| format!("wayland: {e}"))?;
-    let (globals, queue) =
+    let (globals, mut queue) =
         registry_queue_init::<State>(&conn).map_err(|e| format!("wayland: {e}"))?;
     let qh = queue.handle();
     let missing = |what: &str| format!("compositor does not support {what}");
@@ -196,6 +230,9 @@ fn daemon() -> Result<(), String> {
     let _toplevels: ZwlrForeignToplevelManagerV1 = globals
         .bind(&qh, 1..=3, windows::ToplevelManager)
         .map_err(|_| missing("wlr-foreign-toplevel-management"))?;
+    // Optional: without it, keys act on an app's windows on every workspace.
+    let _workspaces: Option<ExtWorkspaceManagerV1> =
+        globals.bind(&qh, 1..=1, windows::WorkspaceManager).ok();
     let vk_manager = globals.bind(&qh, 1..=1, Noop).ok();
 
     let mut event_loop: EventLoop<State> = EventLoop::try_new().map_err(|e| e.to_string())?;
@@ -211,11 +248,23 @@ fn daemon() -> Result<(), String> {
         overlay: Overlay::new(overlay_globals),
         overlay_targets: Vec::new(),
         overlay_serial: 0,
+        peek_serial: 0,
+        peek_ended: None,
         desktop: DesktopIndex::load(),
         desktop_loaded: Instant::now(),
         icons: IconFinder::new(),
     };
 
+    // Pick up existing seats, windows and output sizes before serving commands;
+    // output details take a second round.
+    for _ in 0..2 {
+        queue
+            .roundtrip(&mut state)
+            .map_err(|e| format!("wayland: {e}"))?;
+    }
+    if let Some(seat) = state.seat_state.seats().next() {
+        state.windows.set_seat(seat);
+    }
     WaylandSource::new(conn, queue)
         .insert(event_loop.handle())
         .map_err(|e| e.to_string())?;
@@ -232,13 +281,6 @@ fn daemon() -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
 
-    // Pick up existing seats and windows before serving commands.
-    event_loop
-        .dispatch(Duration::from_millis(100), &mut state)
-        .map_err(|e| e.to_string())?;
-    if let Some(seat) = state.seat_state.seats().next() {
-        state.windows.set_seat(seat);
-    }
     loop {
         event_loop
             .dispatch(None, &mut state)
@@ -266,19 +308,52 @@ impl State {
     fn command(&mut self, line: &str) -> Result<String, String> {
         match Request::parse(line)? {
             Request::Key(key) => self.key(key)?,
-            Request::Overlay if self.overlay.is_open() => self.overlay.close(),
-            Request::Overlay => self.open_overlay(Mode::Browse)?,
+            Request::Overlay => {
+                // A peek gives way to the overlay; the overlay itself toggles.
+                let toggle_off = matches!(self.overlay.mode, Some(Mode::Browse | Mode::Assign(_)));
+                self.end_peek();
+                self.overlay.close();
+                if !toggle_off {
+                    self.open_browse()?;
+                }
+            }
+            Request::Peek(layer) => self.peek_later(layer)?,
+            Request::PeekOff => self.end_peek(),
             Request::Status => return Ok(self.status()),
             Request::Reload => self.reload_desktop(),
         }
         Ok(String::new())
     }
 
+    /// Whether the open overlay gives the number keys a meaning of its own; a
+    /// peek at a named layer does not.
+    fn numbers_on_screen(&self) -> bool {
+        match self.overlay.mode {
+            Some(Mode::Peek { numbered }) => numbered,
+            Some(_) => true,
+            None => false,
+        }
+    }
+
     fn key(&mut self, key: char) -> Result<(), String> {
+        // A number means what the open overlay shows, and pins in assign mode.
+        if key.is_ascii_digit() && self.numbers_on_screen() {
+            let result = self.overlay_choice(key);
+            self.end_peek();
+            return result;
+        }
         let cfg = Config::load()?;
+        self.end_peek();
         self.overlay.close();
+        if let Some(digit) = key.to_digit(10) {
+            let Some(app_id) = self.unpinned(&cfg).into_iter().nth(digit as usize - 1) else {
+                return Ok(());
+            };
+            let actions = self.windows.tracker.show(&app_id, None)?;
+            return self.windows.run(&self.qh, &actions, cfg.warp());
+        }
         let Some(app) = cfg.by_key(key) else {
-            return self.open_overlay(Mode::Assign(key));
+            return self.open_assign(key);
         };
         let (actions, check) =
             self.windows
@@ -322,7 +397,8 @@ impl State {
                     (_, true) => " [minimized]",
                     _ => "",
                 };
-                format!("{}\t{}{}", w.app_id, w.title, flags)
+                let workspace = w.workspace.map_or("?".to_string(), |id| id.to_string());
+                format!("{}\t{workspace}\t{}{}", w.app_id, w.title, flags)
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -349,7 +425,7 @@ impl State {
         out
     }
 
-    fn row(&mut self, key: char, app_id: &str, name: Option<&str>, temporary: bool) -> Row {
+    fn key_app(&mut self, key: char, app_id: &str, name: Option<&str>) -> KeyApp {
         let entry = self.desktop.lookup(app_id).cloned();
         let icon = entry
             .as_ref()
@@ -360,86 +436,183 @@ impl State {
             .or(entry.map(|e| e.name))
             .unwrap_or_else(|| app_id.to_string());
         let running = self.windows.tracker.of_app(app_id).next().is_some();
-        Row {
+        KeyApp {
             key,
             name,
             icon,
             running,
-            temporary,
         }
     }
 
-    fn open_overlay(&mut self, mode: Mode) -> Result<(), String> {
-        let cfg = Config::load()?;
+    fn refresh_desktop(&mut self) {
         if self.desktop_loaded.elapsed() > Duration::from_secs(60) {
             self.reload_desktop();
         }
-        let targets = self.unpinned(&cfg);
-        let numbered: Vec<Row> = targets
+    }
+
+    /// Shows the keyboard if the trigger key is still held after a moment, so
+    /// a quick trigger+letter switches apps without it flashing up.
+    fn peek_later(&mut self, layer: Option<String>) -> Result<(), String> {
+        // A remapper starts commands at once, so the key that ended this peek
+        // can arrive first.
+        if self.peek_ended.is_some_and(|t| t.elapsed() < PEEK_RACE) {
+            return Ok(());
+        }
+        let cfg = Config::load()?;
+        if let Some(name) = &layer {
+            cfg.layer(name).ok_or(format!("no layer named {name}"))?;
+        }
+        self.peek_serial += 1;
+        let serial = self.peek_serial;
+        let delay = cfg.peek_delay();
+        let _ = self
+            .event_loop
+            .insert_source(Timer::from_duration(delay), move |_, _, state| {
+                // A peek replaces another peek, but not an overlay taking keys.
+                let free = matches!(state.overlay.mode, None | Some(Mode::Peek { .. }));
+                if state.peek_serial == serial && free {
+                    if let Err(e) = state.open_peek(layer.as_deref()) {
+                        eprintln!("keydock: {e}");
+                    }
+                    let _ = state.conn.flush();
+                }
+                TimeoutAction::Drop
+            });
+        Ok(())
+    }
+
+    fn end_peek(&mut self) {
+        self.peek_serial += 1;
+        self.peek_ended = Some(Instant::now());
+        if matches!(self.overlay.mode, Some(Mode::Peek { .. })) {
+            self.overlay.close();
+        }
+    }
+
+    /// The open, unpinned apps on the number keys.
+    fn numbered_apps(&mut self, targets: &[String]) -> Vec<KeyApp> {
+        targets
             .iter()
             .enumerate()
-            .map(|(i, id)| self.row(char::from(b'1' + i as u8), id, None, true))
+            .map(|(i, id)| self.key_app(char::from(b'1' + i as u8), id, None))
+            .collect()
+    }
+
+    /// The pinned apps on their letters and `targets` on the number keys.
+    fn all_apps(&mut self, cfg: &Config, targets: &[String]) -> Vec<KeyApp> {
+        let mut apps: Vec<KeyApp> = cfg
+            .apps
+            .iter()
+            .map(|a| self.key_app(a.key, &a.app_id, a.name.as_deref()))
             .collect();
-        let text = i18n::strings(&i18n::languages());
-        // An unpinned key with nothing to pin: say so and close on its own.
-        let nothing_to_pin = matches!(mode, Mode::Assign(_)) && targets.is_empty();
-        let content = match mode {
-            Mode::Browse => {
-                let pinned: Vec<Row> = cfg
-                    .apps
-                    .iter()
-                    .map(|a| self.row(a.key, &a.app_id, a.name.as_deref(), false))
-                    .collect();
-                Content {
-                    title: None,
-                    sections: vec![
-                        Section {
-                            title: text.pinned.into(),
-                            rows: pinned,
-                        },
-                        Section {
-                            title: text.open.into(),
-                            rows: numbered,
-                        },
-                    ],
-                    hint: text.browse_hint.into(),
-                    empty: text.none.into(),
-                }
+        apps.extend(self.numbered_apps(targets));
+        apps
+    }
+
+    fn show(&mut self, mode: Mode, keyboard: Keyboard, cfg: &Config) {
+        self.overlay_serial += 1;
+        let limit = self.smallest_output();
+        self.overlay.open(&self.qh, mode, keyboard, limit, cfg);
+    }
+
+    /// The narrowest and the lowest of the outputs, as the overlay's output is
+    /// the compositor's choice; 0 where no output reports a size.
+    fn smallest_output(&self) -> (u32, u32) {
+        let sizes: Vec<(u32, u32)> = self
+            .output_state
+            .outputs()
+            .filter_map(|o| self.output_state.info(&o)?.logical_size)
+            .map(|(w, h)| (w.max(0) as u32, h.max(0) as u32))
+            .collect();
+        (
+            sizes.iter().map(|s| s.0).min().unwrap_or(0),
+            sizes.iter().map(|s| s.1).min().unwrap_or(0),
+        )
+    }
+
+    fn open_peek(&mut self, layer: Option<&str>) -> Result<(), String> {
+        let cfg = Config::load()?;
+        let (prefix, apps, labels, targets) = match layer {
+            Some(name) => {
+                let layer = cfg.layer(name).ok_or(format!("no layer named {name}"))?;
+                let labels = layer.labels(&i18n::languages());
+                (layer.prefix.clone(), Vec::new(), labels, Vec::new())
             }
-            Mode::Assign(k) => Content {
-                title: Some(text.unassigned.replace(
-                    "{key}",
-                    &format!("{}+{}", cfg.key_label(), k.to_ascii_uppercase()),
-                )),
-                sections: if nothing_to_pin {
-                    Vec::new()
-                } else {
-                    vec![Section {
-                        title: text.assign_section.into(),
-                        rows: numbered,
-                    }]
-                },
-                hint: if nothing_to_pin {
-                    text.assign_nothing.into()
-                } else {
-                    text.assign_hint.into()
-                },
-                empty: text.none.into(),
-            },
+            None => {
+                self.refresh_desktop();
+                let targets = self.unpinned(&cfg);
+                let apps = self.all_apps(&cfg, &targets);
+                (cfg.key_label().to_string(), apps, HashMap::new(), targets)
+            }
+        };
+        let keyboard = Keyboard {
+            layout: Layout::current(&cfg, targets.len())?,
+            title: format!("{prefix} + …"),
+            prefix,
+            apps,
+            labels,
         };
         self.overlay_targets = targets;
-        self.overlay_serial += 1;
-        self.overlay.open(&self.qh, mode, content, &cfg);
+        let numbered = layer.is_none();
+        self.show(Mode::Peek { numbered }, keyboard, &cfg);
+        // In case the release never arrives, as nothing else can close a peek.
+        self.close_overlay_later(PEEK_MAX);
+        Ok(())
+    }
+
+    /// `keydock overlay`: the keyboard of apps, taking key input until closed.
+    fn open_browse(&mut self) -> Result<(), String> {
+        let cfg = Config::load()?;
+        self.refresh_desktop();
+        let targets = self.unpinned(&cfg);
+        let keyboard = Keyboard {
+            layout: Layout::current(&cfg, targets.len())?,
+            title: i18n::strings(&i18n::languages()).browse_hint.to_string(),
+            prefix: cfg.key_label().to_string(),
+            apps: self.all_apps(&cfg, &targets),
+            labels: HashMap::new(),
+        };
+        self.overlay_targets = targets;
+        self.show(Mode::Browse, keyboard, &cfg);
+        Ok(())
+    }
+
+    /// An unpinned letter: the open apps on the number keys, to pin one to it.
+    fn open_assign(&mut self, key: char) -> Result<(), String> {
+        let cfg = Config::load()?;
+        self.refresh_desktop();
+        let targets = self.unpinned(&cfg);
+        let text = i18n::strings(&i18n::languages());
+        let chord = format!("{}+{}", cfg.key_label(), key.to_ascii_uppercase());
+        let unassigned = text.unassigned.replace("{key}", &chord);
+        // With nothing to pin, say so and close on its own.
+        let nothing_to_pin = targets.is_empty();
+        let title = if nothing_to_pin {
+            format!("{unassigned} · {}", text.assign_nothing)
+        } else {
+            format!(
+                "{unassigned} · {} · {}",
+                text.assign_section, text.assign_hint
+            )
+        };
+        let keyboard = Keyboard {
+            layout: Layout::current(&cfg, targets.len())?,
+            title,
+            prefix: cfg.key_label().to_string(),
+            apps: self.numbered_apps(&targets),
+            labels: HashMap::new(),
+        };
+        self.overlay_targets = targets;
+        self.show(Mode::Assign(key), keyboard, &cfg);
         if nothing_to_pin {
-            self.close_overlay_later();
+            self.close_overlay_later(Duration::from_millis(1500));
         }
         Ok(())
     }
 
-    /// Closes the overlay shortly, unless another one opened meanwhile.
-    fn close_overlay_later(&mut self) {
+    /// Closes the overlay after `delay`, unless another one opened meanwhile.
+    fn close_overlay_later(&mut self, delay: Duration) {
         let serial = self.overlay_serial;
-        let delay = Duration::from_millis(1500);
         let _ = self
             .event_loop
             .insert_source(Timer::from_duration(delay), move |_, _, state| {
@@ -482,7 +655,7 @@ impl State {
                     .map_err(|e| e.to_string())?;
                 (app_id, None)
             }
-            (Some(Mode::Browse), Some(app_id)) => (app_id, None),
+            (Some(Mode::Browse | Mode::Peek { .. }), Some(app_id)) => (app_id, None),
             (Some(Mode::Browse), None) => match cfg.by_key(c) {
                 Some(app) => (app.app_id.clone(), app.exec.clone()),
                 None => return Ok(()),
@@ -549,10 +722,10 @@ impl LayerShellHandler for State {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &LayerSurface,
-        _: LayerSurfaceConfigure,
+        configure: LayerSurfaceConfigure,
         _: u32,
     ) {
-        self.overlay.configured(&self.shm);
+        self.overlay.configured(configure.new_size, &self.shm);
     }
 }
 
@@ -684,7 +857,14 @@ mod tests {
         assert_eq!(Request::parse("key C"), Ok(Request::Key('c')));
         assert_eq!(Request::parse("  overlay "), Ok(Request::Overlay));
         assert_eq!(Request::parse("status"), Ok(Request::Status));
-        assert!(Request::parse("key 1").is_err());
+        assert_eq!(Request::parse("peek"), Ok(Request::Peek(None)));
+        assert_eq!(
+            Request::parse("peek numnav"),
+            Ok(Request::Peek(Some("numnav".into())))
+        );
+        assert_eq!(Request::parse("peek off"), Ok(Request::PeekOff));
+        assert_eq!(Request::parse("key 1"), Ok(Request::Key('1')));
+        assert!(Request::parse("key 0").is_err());
         assert!(Request::parse("key ab").is_err());
         assert!(Request::parse("key").is_err());
         assert!(Request::parse("overlay now").is_err());

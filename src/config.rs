@@ -1,8 +1,10 @@
 //! The key -> application table in ~/.config/keydock/config.toml.
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -17,6 +19,47 @@ pub struct AppEntry {
     pub exec: Option<String>,
     /// Name shown in the overlay instead of the desktop entry's.
     pub name: Option<String>,
+}
+
+/// A layer of another tool to show with `keydock peek <name>`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Layer {
+    pub name: String,
+    /// The key held for this layer: the title, and the key drawn highlighted.
+    pub prefix: String,
+    /// Text for each key of the keyboard, e.g. h = "←".
+    pub keys: HashMap<String, String>,
+    /// The same text in other languages, by language such as "zh_CN" or "zh".
+    #[serde(default)]
+    pub translations: HashMap<String, HashMap<String, String>>,
+}
+
+impl Layer {
+    /// The text by lowercase key name, for the first of `languages` it is
+    /// translated to; a translation may cover only some keys.
+    pub fn labels(&self, languages: &[String]) -> HashMap<String, String> {
+        let translation = languages.iter().find_map(|lang| {
+            let primary = lang.split('_').next().unwrap_or(lang);
+            self.translations
+                .get(lang)
+                .or_else(|| self.translations.get(primary))
+        });
+        self.keys
+            .iter()
+            .chain(translation.into_iter().flatten())
+            .map(|(key, text)| (key.to_lowercase(), text.clone()))
+            .collect()
+    }
+}
+
+/// Which layout to draw when an input device is connected.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyboardRule {
+    /// Part of the device name, ignoring case.
+    pub device: String,
+    pub layout: String,
 }
 
 /// Exact match, or a versioned id such as "emacs-32-0-50" for "emacs".
@@ -47,16 +90,25 @@ const DEFAULT_WARP: &str = "super+ctrl+alt+shift+p";
 pub struct Config {
     /// Overlay font family.
     pub font: Option<String>,
-    /// Overlay background opacity, 0.0 to 1.0.
-    opacity: Option<f64>,
     #[serde(default)]
     pub hide: Hide,
     /// Modifier name shown before the letter in the overlay.
     key_label: Option<String>,
     /// Chord that makes the compositor warp the pointer; empty disables it.
     warp: Option<String>,
+    /// Ignored: the overlay is always opaque now, but older configs still set it.
+    #[serde(rename = "opacity")]
+    _opacity: Option<toml::Value>,
+    /// Keyboard layout to draw when no `keyboard` rule matches.
+    layout: Option<String>,
+    /// How long the trigger key is held before the peek shows.
+    peek_delay_ms: Option<u64>,
+    #[serde(default, rename = "keyboard")]
+    keyboards: Vec<KeyboardRule>,
     #[serde(default, rename = "app")]
     pub apps: Vec<AppEntry>,
+    #[serde(default, rename = "layer")]
+    pub layers: Vec<Layer>,
 }
 
 impl Config {
@@ -97,15 +149,19 @@ impl Config {
             }
             seen.push(key);
         }
+        for (i, layer) in cfg.layers.iter().enumerate() {
+            if layer.name == "off" {
+                return Err("a layer cannot be named off".into());
+            }
+            if cfg.layers[..i].iter().any(|l| l.name == layer.name) {
+                return Err(format!("layer {} is defined more than once", layer.name));
+            }
+        }
         Ok(cfg)
     }
 
     pub fn key_label(&self) -> &str {
         self.key_label.as_deref().unwrap_or("Super")
-    }
-
-    pub fn opacity(&self) -> f64 {
-        self.opacity.unwrap_or(1.0).clamp(0.0, 1.0)
     }
 
     /// The warp chord, or None when disabled.
@@ -116,6 +172,27 @@ impl Config {
 
     pub fn by_key(&self, key: char) -> Option<&AppEntry> {
         self.apps.iter().find(|a| a.key.eq_ignore_ascii_case(&key))
+    }
+
+    pub fn peek_delay(&self) -> Duration {
+        Duration::from_millis(self.peek_delay_ms.unwrap_or(400))
+    }
+
+    /// The layout of the first rule matching a device, else the default one.
+    pub fn layout_name(&self, devices: &[String]) -> &str {
+        self.keyboards
+            .iter()
+            .find(|rule| {
+                let wanted = rule.device.to_lowercase();
+                devices.iter().any(|d| d.to_lowercase().contains(&wanted))
+            })
+            .map(|rule| rule.layout.as_str())
+            .or(self.layout.as_deref())
+            .unwrap_or("ansi")
+    }
+
+    pub fn layer(&self, name: &str) -> Option<&Layer> {
+        self.layers.iter().find(|l| l.name == name)
     }
 
     pub fn by_app_id(&self, app_id: &str) -> Option<&AppEntry> {
@@ -154,6 +231,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn labels_follow_the_language() {
+        let cfg = Config::parse(
+            r#"
+            [[layer]]
+            name = "super"
+            prefix = "Super"
+            [layer.keys]
+            q = "Close"
+            f = "Fullscreen"
+            [layer.translations.zh]
+            q = "关闭"
+            [layer.translations.zh_TW]
+            q = "關閉"
+            "#,
+        )
+        .unwrap();
+        let layer = cfg.layer("super").unwrap();
+        let q = |langs: &[&str]| {
+            let langs: Vec<String> = langs.iter().map(|l| l.to_string()).collect();
+            layer.labels(&langs)["q"].clone()
+        };
+        assert_eq!(q(&["de_DE"]), "Close");
+        assert_eq!(q(&["zh_CN"]), "关闭");
+        assert_eq!(q(&["zh_TW"]), "關閉");
+        assert_eq!(q(&["fr", "zh_CN"]), "关闭");
+        assert_eq!(layer.labels(&["zh_CN".into()])["f"], "Fullscreen");
+
+        let cfg = Config::parse(
+            r#"
+            [[layer]]
+            name = "x"
+            prefix = "x"
+            [layer.keys]
+            Left = "Snap"
+            [layer.translations.zh]
+            left = "贴左"
+            "#,
+        )
+        .unwrap();
+        let labels = cfg.layer("x").unwrap().labels(&["zh".into()]);
+        assert_eq!(labels["left"], "贴左");
+        assert_eq!(labels.len(), 1);
+    }
+
+    #[test]
+    fn picks_the_layout_of_a_connected_device() {
+        let cfg = Config::parse(
+            r#"
+            layout = "mine"
+            [[keyboard]]
+            device = "corne"
+            layout = "corne"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.layout_name(&["foostan Corne v4".into()]), "corne");
+        assert_eq!(cfg.layout_name(&["AT keyboard".into()]), "mine");
+        assert_eq!(Config::default().layout_name(&[]), "ansi");
+    }
+
+    #[test]
+    fn rejects_bad_layers() {
+        let layer =
+            |name: &str| format!("[[layer]]\nname = \"{name}\"\nprefix = \"x\"\nkeys = {{}}\n");
+        assert!(Config::parse(&layer("off")).is_err());
+        assert!(Config::parse(&(layer("a") + &layer("a"))).is_err());
+    }
+
+    #[test]
     fn parses_full_config() {
         let cfg = Config::parse(
             r#"
@@ -161,7 +307,6 @@ mod tests {
             hide = "previous"
             key_label = "Hyper"
             warp = "alt+super+f12"
-            opacity = 0.8
 
             [[app]]
             key = "c"
@@ -173,7 +318,6 @@ mod tests {
         assert_eq!(cfg.hide, Hide::Previous);
         assert_eq!(cfg.key_label(), "Hyper");
         assert_eq!(cfg.warp(), Some("alt+super+f12"));
-        assert_eq!(cfg.opacity(), 0.8);
         assert_eq!(cfg.by_key('C').unwrap().exec.as_deref(), Some("kitty"));
         assert!(cfg.by_app_id("Kitty").is_some());
     }
@@ -184,8 +328,11 @@ mod tests {
         assert_eq!(cfg.hide, Hide::Auto);
         assert_eq!(cfg.key_label(), "Super");
         assert_eq!(cfg.warp(), Some(DEFAULT_WARP));
-        assert_eq!(cfg.opacity(), 1.0);
-        assert_eq!(Config::parse("opacity = 3.0").unwrap().opacity(), 1.0);
+    }
+
+    #[test]
+    fn accepts_the_old_opacity_setting() {
+        assert!(Config::parse("opacity = 0.8").is_ok());
     }
 
     #[test]
