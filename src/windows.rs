@@ -12,6 +12,11 @@ use smithay_client_toolkit::dispatch2::Dispatch2;
 use wayland_client::backend::ObjectData;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::{Connection, Proxy, QueueHandle};
+use wayland_protocols::ext::workspace::v1::client::{
+    ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1,
+    ext_workspace_handle_v1::{self as workspace, ExtWorkspaceHandleV1},
+    ext_workspace_manager_v1::{self as workspaces, ExtWorkspaceManagerV1},
+};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
@@ -22,9 +27,9 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
 };
 use xkbcommon::xkb;
 
-use crate::State;
 use crate::tracker::{Action, Id, Tracker};
 use crate::tray;
+use crate::{Noop, State};
 
 pub struct Windows {
     pub tracker: Tracker,
@@ -245,6 +250,59 @@ impl Dispatch2<ZwlrForeignToplevelHandleV1, State> for Toplevel {
                 windows.handles.remove(&id);
                 handle.destroy();
             }
+            _ => {}
+        }
+    }
+}
+
+/// User data for ext-workspace: only tells the tracker the active workspace.
+pub struct WorkspaceManager;
+struct Workspace;
+
+impl Dispatch2<ExtWorkspaceManagerV1, State> for WorkspaceManager {
+    fn event(
+        &self,
+        _: &mut State,
+        _: &ExtWorkspaceManagerV1,
+        _: workspaces::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+    }
+
+    fn event_created_child(opcode: u16, qh: &QueueHandle<State>) -> Arc<dyn ObjectData> {
+        match opcode {
+            workspaces::EVT_WORKSPACE_GROUP_OPCODE => {
+                qh.make_data::<ExtWorkspaceGroupHandleV1, _>(Noop)
+            }
+            workspaces::EVT_WORKSPACE_OPCODE => qh.make_data::<ExtWorkspaceHandleV1, _>(Workspace),
+            _ => unreachable!("ext-workspace event {opcode} creates no object"),
+        }
+    }
+}
+
+impl Dispatch2<ExtWorkspaceHandleV1, State> for Workspace {
+    fn event(
+        &self,
+        state: &mut State,
+        handle: &ExtWorkspaceHandleV1,
+        event: workspace::Event,
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        match event {
+            workspace::Event::State { state: flags } => {
+                if flags
+                    .into_result()
+                    .is_ok_and(|f| f.contains(workspace::State::Active))
+                {
+                    state
+                        .windows
+                        .tracker
+                        .set_workspace(handle.id().protocol_id());
+                }
+            }
+            workspace::Event::Removed => handle.destroy(),
             _ => {}
         }
     }

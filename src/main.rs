@@ -44,6 +44,7 @@ use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_seat, wl_surface},
 };
+use wayland_protocols::ext::workspace::v1::client::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
 use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
 
 use config::Config;
@@ -229,6 +230,9 @@ fn daemon() -> Result<(), String> {
     let _toplevels: ZwlrForeignToplevelManagerV1 = globals
         .bind(&qh, 1..=3, windows::ToplevelManager)
         .map_err(|_| missing("wlr-foreign-toplevel-management"))?;
+    // Optional: without it, keys act on an app's windows on every workspace.
+    let _workspaces: Option<ExtWorkspaceManagerV1> =
+        globals.bind(&qh, 1..=1, windows::WorkspaceManager).ok();
     let vk_manager = globals.bind(&qh, 1..=1, Noop).ok();
 
     let mut event_loop: EventLoop<State> = EventLoop::try_new().map_err(|e| e.to_string())?;
@@ -390,7 +394,8 @@ impl State {
                     (_, true) => " [minimized]",
                     _ => "",
                 };
-                format!("{}\t{}{}", w.app_id, w.title, flags)
+                let workspace = w.workspace.map_or("?".to_string(), |id| id.to_string());
+                format!("{}\t{workspace}\t{}{}", w.app_id, w.title, flags)
             })
             .collect::<Vec<_>>()
             .join("\n");

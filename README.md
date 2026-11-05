@@ -8,7 +8,9 @@ Hold the trigger key for a moment and a keyboard shows what each key does:
 ![Pinned apps on their letters while Tab is held](docs/images/peek-apps.png)
 
 - **A pinned letter** focuses the app, hides it when it is already focused, or launches it.
-  All of the app's windows come forward together and the most recently used one ends on top.
+  Its windows on the current workspace come forward together, the most recently used on top;
+  with none there, the key goes to the workspace of its latest window. Hiding also acts on that
+  workspace only, and switching windows across workspaces is left to the compositor.
   Windows you minimized one by one stay minimized. An app that closed to the tray is restored
   from its tray icon instead of being launched again, when its executable is named like its app id.
 - **Hiding** minimizes the app's windows. Tiling compositors (niri, Hyprland, sway) ignore
@@ -28,6 +30,9 @@ Hold the trigger key for a moment and a keyboard shows what each key does:
 
 keydock tracks its own most-recently-used window order through
 `wlr-foreign-toplevel-management`, so the behaviour does not depend on compositor internals.
+No protocol says which workspace a window is on, so keydock notes the active workspace from
+`ext-workspace` whenever a window gets focus. A window that has not had focus since the daemon
+started counts as on every workspace, and so does every window where `ext-workspace` is missing.
 The overlay is a layer-shell surface drawn with cairo and pango, with fractional scaling.
 Its text follows the session language (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`) as the daemon
 saw it when it started: English, Simplified Chinese and Traditional Chinese are included, with
@@ -41,7 +46,7 @@ keydock key <1-9>      focus that open, unpinned app
 keydock overlay        show or hide the overlay
 keydock peek [layer]   a layer's key is held: show it on a keyboard after a moment
 keydock peek off       the key is released: hide it
-keydock status         list tracked windows, most recently used first
+keydock status         list tracked windows, most recently used first, with their workspace
 keydock reload         re-read desktop entries and icons
 keydock daemon         run the background service (other commands start it if needed)
 ```
