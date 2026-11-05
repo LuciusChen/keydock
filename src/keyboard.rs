@@ -113,18 +113,13 @@ pub fn paint(
         } else {
             label.to_string()
         };
-        let color = if held || used {
-            t.on_surface
-        } else {
-            t.on_surface.alpha(0.65)
-        };
-        let l = layout(&text, 11.0, held);
-        color.set(cr);
+        let l = layout(&text, 13.0, held);
+        t.on_surface.set(cr);
         cr.move_to(x + 5.0, y + 3.0);
         pangocairo::functions::show_layout(cr, &l);
 
         if let Some(bound) = bound {
-            let l = layout(bound, 11.5, true);
+            let l = layout(bound, 13.0, true);
             l.set_width(((w - 6.0) * pango::SCALE as f64) as i32);
             l.set_ellipsize(pango::EllipsizeMode::End);
             l.set_alignment(pango::Alignment::Center);

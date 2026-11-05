@@ -194,10 +194,8 @@ impl Overlay {
                 .set_input_region(Some(region.wl_region()));
         }
         layer.set_anchor(Anchor::empty());
-        let fit = fit_within((w, h), limit);
-        // A zero size would be a protocol error without anchors to opposite edges.
-        let asked = |n: u32| (n as f64 * fit).max(1.0) as u32;
-        layer.set_size(asked(w), asked(h));
+        let (asked_w, asked_h) = shown_size((w, h), fit_within((w, h), limit), self.scale120);
+        layer.set_size(asked_w, asked_h);
         if let (Some(f), Some(v)) = (&g.fractional, &g.viewporter) {
             self.fractional = Some(f.get_fractional_scale(layer.wl_surface(), qh, Scale));
             self.viewport = Some(v.get_viewport(layer.wl_surface(), qh, Noop));
@@ -235,6 +233,10 @@ impl Overlay {
     pub fn set_scale(&mut self, scale120: u32, shm: &Shm) {
         if scale120 != self.scale120 {
             self.scale120 = scale120;
+            if let Some(layer) = &self.layer {
+                let (w, h) = shown_size(self.size, self.fit, scale120);
+                layer.set_size(w, h);
+            }
             if self.configured {
                 self.draw(shm);
             }
@@ -250,18 +252,17 @@ impl Overlay {
             return;
         }
         let (w, h) = self.size;
-        let scale = self.scale120 as f64 / 120.0;
         // Without viewporter, fall back to integer buffer scaling.
-        let scale = if self.viewport.is_some() {
-            scale
+        let scale120 = if self.viewport.is_some() {
+            self.scale120
         } else {
-            scale.ceil()
+            self.scale120.div_ceil(120) * 120
         };
-        let shown = |n: u32| (n as f64 * self.fit).floor().max(1.0) as i32;
-        let (shown_w, shown_h) = (shown(w), shown(h));
+        let scale = scale120 as f64 / 120.0;
+        let (shown_w, shown_h) = shown_size((w, h), self.fit, scale120);
         let (bw, bh) = (
-            (shown_w as f64 * scale).ceil() as i32,
-            (shown_h as f64 * scale).ceil() as i32,
+            (shown_w * scale120).div_ceil(120) as i32,
+            (shown_h * scale120).div_ceil(120) as i32,
         );
         // Everything inside is drawn at its full size and scaled to fit.
         let scale_in = scale * self.fit;
@@ -279,7 +280,11 @@ impl Overlay {
         {
             let cr = cairo::Context::new(&image).expect("cairo context");
             cr.scale(scale_in, scale_in);
-            card(&cr, &self.theme, (w as f64, h as f64));
+            card(
+                &cr,
+                &self.theme,
+                (shown_w as f64 / self.fit, shown_h as f64 / self.fit),
+            );
             let keyboard = self.keyboard.as_ref().expect("keyboard");
             keyboard::paint(&cr, &self.theme, &self.font, keyboard, &icons, scale_in);
         }
@@ -304,7 +309,7 @@ impl Overlay {
         let layer = self.layer.as_ref().expect("layer");
         let surface = layer.wl_surface();
         if let Some(v) = &self.viewport {
-            v.set_destination(shown_w, shown_h);
+            v.set_destination(shown_w as i32, shown_h as i32);
         } else {
             surface.set_buffer_scale(scale as i32);
         }
@@ -320,6 +325,23 @@ impl Overlay {
             .or_insert_with(|| render_icon(path, px))
             .clone()
     }
+}
+
+/// The surface size for `size` shrunk by `fit`. At full size it is a whole number
+/// of device pixels, or the compositor rounds the buffer's edges to a slightly
+/// different size and rescales it, blurring everything drawn on it.
+fn shown_size((w, h): (u32, u32), fit: f64, scale120: u32) -> (u32, u32) {
+    let shown = |n: u32| {
+        if fit < 1.0 {
+            // A zero size would be a protocol error without anchors to opposite edges.
+            (n as f64 * fit).floor().max(1.0) as u32
+        } else {
+            (n..)
+                .find(|s| (s * scale120).is_multiple_of(120))
+                .unwrap_or(n)
+        }
+    };
+    (shown(w), shown(h))
 }
 
 /// How far to shrink `size` to fit `bounds`, where a 0 bound is no limit.
@@ -444,6 +466,15 @@ impl Dispatch2<WpFractionalScaleV1, State> for Scale {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_size_surfaces_are_whole_device_pixels() {
+        assert_eq!(shown_size((778, 308), 1.0, 192), (780, 310));
+        assert_eq!(shown_size((777, 308), 1.0, 180), (778, 308));
+        assert_eq!(shown_size((778, 308), 1.0, 120), (778, 308));
+        assert_eq!(shown_size((778, 308), 0.5, 192), (389, 154));
+        assert_eq!(shown_size((778, 308), 0.001, 192), (1, 1));
+    }
 
     #[test]
     fn fits_within_what_the_compositor_offers() {
