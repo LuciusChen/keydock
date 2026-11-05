@@ -215,7 +215,7 @@ fn daemon() -> Result<(), String> {
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
 
     let conn = Connection::connect_to_env().map_err(|e| format!("wayland: {e}"))?;
-    let (globals, queue) =
+    let (globals, mut queue) =
         registry_queue_init::<State>(&conn).map_err(|e| format!("wayland: {e}"))?;
     let qh = queue.handle();
     let missing = |what: &str| format!("compositor does not support {what}");
@@ -255,6 +255,16 @@ fn daemon() -> Result<(), String> {
         icons: IconFinder::new(),
     };
 
+    // Pick up existing seats, windows and output sizes before serving commands;
+    // output details take a second round.
+    for _ in 0..2 {
+        queue
+            .roundtrip(&mut state)
+            .map_err(|e| format!("wayland: {e}"))?;
+    }
+    if let Some(seat) = state.seat_state.seats().next() {
+        state.windows.set_seat(seat);
+    }
     WaylandSource::new(conn, queue)
         .insert(event_loop.handle())
         .map_err(|e| e.to_string())?;
@@ -271,13 +281,6 @@ fn daemon() -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
 
-    // Pick up existing seats and windows before serving commands.
-    event_loop
-        .dispatch(Duration::from_millis(100), &mut state)
-        .map_err(|e| e.to_string())?;
-    if let Some(seat) = state.seat_state.seats().next() {
-        state.windows.set_seat(seat);
-    }
     loop {
         event_loop
             .dispatch(None, &mut state)

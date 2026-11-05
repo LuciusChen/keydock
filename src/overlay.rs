@@ -195,7 +195,9 @@ impl Overlay {
         }
         layer.set_anchor(Anchor::empty());
         let fit = fit_within((w, h), limit);
-        layer.set_size((w as f64 * fit) as u32, (h as f64 * fit) as u32);
+        // A zero size would be a protocol error without anchors to opposite edges.
+        let asked = |n: u32| (n as f64 * fit).max(1.0) as u32;
+        layer.set_size(asked(w), asked(h));
         if let (Some(f), Some(v)) = (&g.fractional, &g.viewporter) {
             self.fractional = Some(f.get_fractional_scale(layer.wl_surface(), qh, Scale));
             self.viewport = Some(v.get_viewport(layer.wl_surface(), qh, Noop));
