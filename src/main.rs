@@ -6,6 +6,7 @@
 mod config;
 mod desktop;
 mod i18n;
+mod keyboard;
 mod overlay;
 mod tracker;
 mod tray;
@@ -45,7 +46,8 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_m
 
 use config::Config;
 use desktop::{DesktopIndex, IconFinder};
-use overlay::{Content, Mode, Overlay, Row, Section};
+use keyboard::Keyboard;
+use overlay::{Content, Mode, Overlay, Row, Section, View};
 use tracker::MinimizeCheck;
 use windows::Windows;
 
@@ -55,6 +57,8 @@ const USAGE: &str = "usage: keydock <command>
   key <letter>  focus, hide or launch the app pinned to <letter>;
                 an unpinned letter opens the overlay to pin an open app
   overlay       show or hide the overlay of pinned and open apps
+  peek          the trigger key is held: show the pinned apps on a keyboard
+                after a moment, until \"peek off\" or the next key
   status        list tracked windows, most recently used first
   reload        re-read desktop entries and icons";
 
@@ -131,6 +135,8 @@ fn client(line: &str) -> i32 {
 enum Request {
     Key(char),
     Overlay,
+    /// The trigger key was pressed (true) or released (false).
+    Peek(bool),
     Status,
     Reload,
 }
@@ -144,6 +150,8 @@ impl Request {
                 _ => Err(format!("not a letter: {k}")),
             },
             ["overlay"] => Ok(Request::Overlay),
+            ["peek"] => Ok(Request::Peek(true)),
+            ["peek", "off"] => Ok(Request::Peek(false)),
             ["status"] => Ok(Request::Status),
             ["reload"] => Ok(Request::Reload),
             _ => Err(format!("unknown command: {line}\n{USAGE}")),
@@ -165,6 +173,8 @@ pub struct State {
     overlay_targets: Vec<String>,
     /// Counts overlay openings, so a pending auto-close skips a newer overlay.
     overlay_serial: u64,
+    /// Counts peek presses, releases and keys, so a pending peek skips stale ones.
+    peek_serial: u64,
     desktop: DesktopIndex,
     desktop_loaded: Instant,
     icons: IconFinder,
@@ -211,6 +221,7 @@ fn daemon() -> Result<(), String> {
         overlay: Overlay::new(overlay_globals),
         overlay_targets: Vec::new(),
         overlay_serial: 0,
+        peek_serial: 0,
         desktop: DesktopIndex::load(),
         desktop_loaded: Instant::now(),
         icons: IconFinder::new(),
@@ -268,6 +279,8 @@ impl State {
             Request::Key(key) => self.key(key)?,
             Request::Overlay if self.overlay.is_open() => self.overlay.close(),
             Request::Overlay => self.open_overlay(Mode::Browse)?,
+            Request::Peek(true) => self.peek_later(),
+            Request::Peek(false) => self.end_peek(),
             Request::Status => return Ok(self.status()),
             Request::Reload => self.reload_desktop(),
         }
@@ -276,6 +289,7 @@ impl State {
 
     fn key(&mut self, key: char) -> Result<(), String> {
         let cfg = Config::load()?;
+        self.peek_serial += 1;
         self.overlay.close();
         let Some(app) = cfg.by_key(key) else {
             return self.open_overlay(Mode::Assign(key));
@@ -369,11 +383,59 @@ impl State {
         }
     }
 
-    fn open_overlay(&mut self, mode: Mode) -> Result<(), String> {
-        let cfg = Config::load()?;
+    fn refresh_desktop(&mut self) {
         if self.desktop_loaded.elapsed() > Duration::from_secs(60) {
             self.reload_desktop();
         }
+    }
+
+    /// Shows the keyboard if the trigger key is still held after a moment, so
+    /// a quick trigger+letter switches apps without it flashing up.
+    fn peek_later(&mut self) {
+        self.peek_serial += 1;
+        let serial = self.peek_serial;
+        let delay = Duration::from_millis(400);
+        let _ = self
+            .event_loop
+            .insert_source(Timer::from_duration(delay), move |_, _, state| {
+                if state.peek_serial == serial && !state.overlay.is_open() {
+                    if let Err(e) = state.open_peek() {
+                        eprintln!("keydock: {e}");
+                    }
+                    let _ = state.conn.flush();
+                }
+                TimeoutAction::Drop
+            });
+    }
+
+    fn end_peek(&mut self) {
+        self.peek_serial += 1;
+        if matches!(self.overlay.mode, Some(Mode::Peek)) {
+            self.overlay.close();
+        }
+    }
+
+    fn open_peek(&mut self) -> Result<(), String> {
+        let cfg = Config::load()?;
+        self.refresh_desktop();
+        let apps = cfg
+            .apps
+            .iter()
+            .map(|a| self.row(a.key, &a.app_id, a.name.as_deref(), false))
+            .collect();
+        let text = i18n::strings(&i18n::languages());
+        let view = View::Keyboard(Keyboard {
+            title: text.peek_title.replace("{key}", cfg.key_label()),
+            held: cfg.key_label().to_string(),
+            apps,
+        });
+        self.overlay.open(&self.qh, Mode::Peek, view, &cfg);
+        Ok(())
+    }
+
+    fn open_overlay(&mut self, mode: Mode) -> Result<(), String> {
+        let cfg = Config::load()?;
+        self.refresh_desktop();
         let targets = self.unpinned(&cfg);
         let numbered: Vec<Row> = targets
             .iter()
@@ -406,6 +468,7 @@ impl State {
                     empty: text.none.into(),
                 }
             }
+            Mode::Peek => unreachable!("peeks open through open_peek"),
             Mode::Assign(k) => Content {
                 title: Some(text.unassigned.replace(
                     "{key}",
@@ -429,7 +492,7 @@ impl State {
         };
         self.overlay_targets = targets;
         self.overlay_serial += 1;
-        self.overlay.open(&self.qh, mode, content, &cfg);
+        self.overlay.open(&self.qh, mode, View::List(content), &cfg);
         if nothing_to_pin {
             self.close_overlay_later();
         }
@@ -684,6 +747,8 @@ mod tests {
         assert_eq!(Request::parse("key C"), Ok(Request::Key('c')));
         assert_eq!(Request::parse("  overlay "), Ok(Request::Overlay));
         assert_eq!(Request::parse("status"), Ok(Request::Status));
+        assert_eq!(Request::parse("peek"), Ok(Request::Peek(true)));
+        assert_eq!(Request::parse("peek off"), Ok(Request::Peek(false)));
         assert!(Request::parse("key 1").is_err());
         assert!(Request::parse("key ab").is_err());
         assert!(Request::parse("key").is_err());

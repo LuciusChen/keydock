@@ -14,6 +14,10 @@ The examples bind Super+letter; any trigger that runs `keydock key <letter>` wor
   Letters and numbers in the overlay switch to an app; Esc closes it.
 - **An unpinned letter** opens the overlay so you can pin an open app to that letter;
   with no open app to pin, it says so and closes itself.
+- **Peeking**: when the trigger key is held for a moment, a keyboard shows the app on each
+  letter, and it goes away when the key is released or a letter is pressed. It never takes
+  key input, so letters keep switching apps while it shows. This needs a trigger that reports
+  both press and release, such as a kanata layer key; see [Peeking with kanata](#peeking-with-kanata).
 
 keydock tracks its own most-recently-used window order through
 `wlr-foreign-toplevel-management`, so the behaviour does not depend on compositor internals.
@@ -26,6 +30,8 @@ English, Simplified Chinese and Traditional Chinese are included, with English a
 ```text
 keydock key <letter>   focus, hide or launch the app pinned to <letter>
 keydock overlay        show or hide the overlay
+keydock peek           the trigger key is held: show the keyboard after a moment
+keydock peek off       the trigger key is released: hide it
 keydock status         list tracked windows, most recently used first
 keydock reload         re-read desktop entries and icons
 keydock daemon         run the background service (other commands start it if needed)
@@ -40,7 +46,7 @@ font = "sans"          # optional overlay font
 hide = "auto"          # auto | minimize | previous (focus the previous app)
 key_label = "Super"    # modifier name shown in the overlay, e.g. "Hyper"
 warp = "super+ctrl+alt+shift+p"  # chord for the compositor's cursor warp; "" disables it
-opacity = 1.0          # overlay background opacity, 0.0 to 1.0
+opacity = 1.0          # overlay background opacity, 0.0 to 1.0; the peek keyboard stays opaque
 
 [[app]]
 key = "c"
@@ -91,6 +97,30 @@ to match, and keep the `warp` chord free of app bindings.
 
 Start `keydock daemon` from the session autostart. Any other command starts it if needed.
 
+## Peeking with kanata
+
+A held Tab can be the trigger: its layer sends `keydock key <letter>`, and pressing and
+releasing it send `keydock peek` and `keydock peek off`. Set `key_label = "Tab"` so the
+keyboard highlights Tab. Run the commands as the desktop user when kanata runs as root.
+
+```lisp
+(defalias
+  tab-apps (tap-hold-press 200 200 tab
+             (multi (layer-while-held apps)
+                    (cmd keydock peek)
+                    (on-release tap-vkey peek-off))))
+
+(defvirtualkeys
+  peek-off (cmd keydock peek off))
+
+(deflayermap (apps)
+  a (cmd keydock key a)
+  ;; ... one line per letter
+  / (cmd keydock overlay))
+```
+
+The `cmd` action needs `danger-enable-cmd yes` in `defcfg` and a kanata build with it enabled.
+
 ## Other compositors (untested)
 
 Bind the same commands; the cursor-warp chord is only needed where the compositor does not
@@ -133,6 +163,7 @@ CI runs the same checks. The code is split so the decisions can be tested withou
 | `src/tray.rs` | Restores an app from its StatusNotifierItem tray icon over D-Bus before launching it. |
 | `src/config.rs` | Loading, validating and appending to `config.toml`. |
 | `src/overlay.rs` | The layer-shell overlay, drawn with cairo and pango. |
+| `src/keyboard.rs` | The peek view: a keyboard with the pinned apps on their letters. |
 | `src/desktop.rs` | Desktop entries and icon-theme lookup. |
 | `src/i18n.rs` | Session language and overlay text. |
 | `src/main.rs` | Command line, the daemon's socket and event loop, and wiring. |

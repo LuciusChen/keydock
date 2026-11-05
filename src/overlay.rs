@@ -21,6 +21,7 @@ use wayland_protocols::wp::viewporter::client::{
 };
 
 use crate::config::Config;
+use crate::keyboard::{self, Keyboard};
 use crate::{Noop, State};
 
 pub enum Mode {
@@ -28,6 +29,30 @@ pub enum Mode {
     Browse,
     /// An unpinned Super+letter: pick an open app to pin to that letter.
     Assign(char),
+    /// The trigger key is held: show the keyboard without taking key input.
+    Peek,
+}
+
+pub enum View {
+    List(Content),
+    Keyboard(Keyboard),
+}
+
+impl View {
+    /// Icon paths in drawing order, and their size in logical pixels.
+    fn icons(&self) -> (Vec<Option<PathBuf>>, f64) {
+        match self {
+            View::List(c) => (
+                c.sections
+                    .iter()
+                    .flat_map(|s| s.rows.iter())
+                    .map(|r| r.icon.clone())
+                    .collect(),
+                ICON,
+            ),
+            View::Keyboard(kb) => (kb.icon_paths(), keyboard::ICON),
+        }
+    }
 }
 
 pub struct Row {
@@ -53,7 +78,7 @@ pub struct Content {
 }
 
 #[derive(Clone, Copy)]
-struct Rgba(f64, f64, f64, f64);
+pub struct Rgba(f64, f64, f64, f64);
 
 impl Rgba {
     fn hex(s: &str) -> Option<Rgba> {
@@ -66,21 +91,21 @@ impl Rgba {
         let a = if s.len() >= 8 { v(6)? } else { 1.0 };
         Some(Rgba(v(0)?, v(2)?, v(4)?, a))
     }
-    fn alpha(self, a: f64) -> Rgba {
+    pub fn alpha(self, a: f64) -> Rgba {
         Rgba(self.0, self.1, self.2, self.3 * a)
     }
-    fn set(self, cr: &cairo::Context) {
+    pub fn set(self, cr: &cairo::Context) {
         cr.set_source_rgba(self.0, self.1, self.2, self.3);
     }
 }
 
 /// Colors written by the Noctalia template, with dark fallbacks.
-struct Theme {
-    surface: Rgba,
-    on_surface: Rgba,
-    on_surface_variant: Rgba,
-    primary: Rgba,
-    outline: Rgba,
+pub struct Theme {
+    pub surface: Rgba,
+    pub on_surface: Rgba,
+    pub on_surface_variant: Rgba,
+    pub primary: Rgba,
+    pub outline: Rgba,
 }
 
 impl Theme {
@@ -138,7 +163,7 @@ pub struct Globals {
 pub struct Overlay {
     globals: Globals,
     pub mode: Option<Mode>,
-    content: Option<Content>,
+    view: Option<View>,
     layer: Option<LayerSurface>,
     fractional: Option<WpFractionalScaleV1>,
     viewport: Option<WpViewport>,
@@ -157,7 +182,7 @@ impl Overlay {
         Overlay {
             globals,
             mode: None,
-            content: None,
+            view: None,
             layer: None,
             fractional: None,
             viewport: None,
@@ -181,16 +206,29 @@ impl Overlay {
             .is_some_and(|l| l.wl_surface() == surface)
     }
 
-    /// Shows `content`, or replaces what an open overlay shows.
-    pub fn open(&mut self, qh: &QueueHandle<State>, mode: Mode, content: Content, cfg: &Config) {
+    /// Shows `view`, or replaces what an open overlay shows.
+    pub fn open(&mut self, qh: &QueueHandle<State>, mode: Mode, view: View, cfg: &Config) {
         self.theme = Theme::load();
-        self.theme.surface = self.theme.surface.alpha(cfg.opacity());
+        // The keyboard is read at a glance over any window, so it stays opaque.
+        if !matches!(mode, Mode::Peek) {
+            self.theme.surface = self.theme.surface.alpha(cfg.opacity());
+        }
         self.font = cfg.font.as_deref().unwrap_or("sans").to_string();
-        let (w, h) = self.measure(&content);
+        let (w, h) = match &view {
+            View::List(content) => self.measure(content),
+            View::Keyboard(kb) => kb.size(),
+        };
+        let (w, h) = (w.ceil() as u32, h.ceil() as u32);
+        // A peek only shows; keys keep going to the focused window.
+        let input = match mode {
+            Mode::Peek => KeyboardInteractivity::None,
+            _ => KeyboardInteractivity::Exclusive,
+        };
         self.size = (w, h);
-        self.content = Some(content);
+        self.view = Some(view);
         self.mode = Some(mode);
         if let Some(layer) = &self.layer {
+            layer.set_keyboard_interactivity(input);
             layer.set_size(w, h);
             layer.commit();
             return;
@@ -200,7 +238,7 @@ impl Overlay {
         let layer =
             g.layer_shell
                 .create_layer_surface(qh, surface, Layer::Overlay, Some("keydock"), None);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        layer.set_keyboard_interactivity(input);
         layer.set_anchor(Anchor::empty());
         layer.set_size(w, h);
         if let (Some(f), Some(v)) = (&g.fractional, &g.viewporter) {
@@ -221,7 +259,7 @@ impl Overlay {
         }
         self.layer = None; // dropping destroys the layer surface
         self.mode = None;
-        self.content = None;
+        self.view = None;
     }
 
     pub fn configured(&mut self, shm: &Shm) {
@@ -238,7 +276,7 @@ impl Overlay {
         }
     }
 
-    fn measure(&self, content: &Content) -> (u32, u32) {
+    fn measure(&self, content: &Content) -> (f64, f64) {
         let surface =
             cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).expect("cairo surface");
         let cr = cairo::Context::new(&surface).expect("cairo context");
@@ -259,12 +297,11 @@ impl Overlay {
             }
         }
         let row_w = BADGE + GAP + ICON + GAP + name_w + GAP * 2.0 + 6.0;
-        let w = (PAD * 2.0 + row_w.max(other_w)).max(MIN_W);
-        (w.ceil() as u32, h.ceil() as u32)
+        ((PAD * 2.0 + row_w.max(other_w)).max(MIN_W), h)
     }
 
     fn draw(&mut self, shm: &Shm) {
-        let Some(content) = self.content.as_ref() else {
+        let Some(view) = self.view.as_ref() else {
             return;
         };
         if self.layer.is_none() {
@@ -284,13 +321,8 @@ impl Overlay {
         );
         let stride = bw * 4;
 
-        let px = (scale * ICON).round() as i32;
-        let paths: Vec<Option<PathBuf>> = content
-            .sections
-            .iter()
-            .flat_map(|s| s.rows.iter())
-            .map(|r| r.icon.clone())
-            .collect();
+        let (paths, icon_size) = view.icons();
+        let px = (scale * icon_size).round() as i32;
         let icons: Vec<Option<cairo::ImageSurface>> = paths
             .into_iter()
             .map(|p| p.and_then(|p| self.icon(&p, px)))
@@ -301,16 +333,16 @@ impl Overlay {
         {
             let cr = cairo::Context::new(&image).expect("cairo context");
             cr.scale(scale, scale);
-            let content = self.content.as_ref().expect("content");
-            paint(
-                &cr,
-                &self.theme,
-                &self.font,
-                content,
-                (w as f64, h as f64),
-                &icons,
-                scale,
-            );
+            let size = (w as f64, h as f64);
+            card(&cr, &self.theme, size);
+            match self.view.as_ref().expect("view") {
+                View::List(content) => {
+                    paint(&cr, &self.theme, &self.font, content, size, &icons, scale)
+                }
+                View::Keyboard(kb) => {
+                    keyboard::paint(&cr, &self.theme, &self.font, kb, &icons, scale)
+                }
+            }
         }
         image.flush();
         let src_stride = image.stride() as usize;
@@ -351,24 +383,26 @@ impl Overlay {
     }
 }
 
-fn paint(
-    cr: &cairo::Context,
-    t: &Theme,
-    font: &str,
-    c: &Content,
-    (w, h): (f64, f64),
-    icons: &[Option<cairo::ImageSurface>],
-    scale: f64,
-) {
-    let layout = |text: &str, px: f64, bold: bool| text_layout(cr, font, text, px, bold);
-    // Card.
+/// The rounded background every view is drawn on.
+fn card(cr: &cairo::Context, t: &Theme, (w, h): (f64, f64)) {
     rounded(cr, 0.5, 0.5, w - 1.0, h - 1.0, 16.0);
     t.surface.set(cr);
     cr.fill_preserve().ok();
     t.outline.alpha(0.35).set(cr);
     cr.set_line_width(1.0);
     cr.stroke().ok();
+}
 
+fn paint(
+    cr: &cairo::Context,
+    t: &Theme,
+    font: &str,
+    c: &Content,
+    (w, _h): (f64, f64),
+    icons: &[Option<cairo::ImageSurface>],
+    scale: f64,
+) {
+    let layout = |text: &str, px: f64, bold: bool| text_layout(cr, font, text, px, bold);
     let mut y = PAD;
     let text = |l: &pango::Layout, x: f64, y: f64, color: Rgba| {
         color.set(cr);
@@ -418,12 +452,8 @@ fn paint(
 
             let x_icon = PAD + BADGE + GAP;
             if let Some(Some(img)) = icons.get(icon_i) {
-                cr.save().ok();
-                cr.translate(x_icon, mid - ICON / 2.0);
-                cr.scale(1.0 / scale, 1.0 / scale);
-                cr.set_source_surface(img, 0.0, 0.0).ok();
-                cr.paint_with_alpha(if r.running { 1.0 } else { 0.55 }).ok();
-                cr.restore().ok();
+                let alpha = if r.running { 1.0 } else { 0.55 };
+                draw_icon(cr, img, x_icon, mid - ICON / 2.0, scale, alpha);
             }
             icon_i += 1;
 
@@ -450,7 +480,30 @@ fn paint(
     text(&l, PAD + 2.0, y + 8.0, t.on_surface_variant.alpha(0.85));
 }
 
-fn text_layout(cr: &cairo::Context, font: &str, text: &str, px: f64, bold: bool) -> pango::Layout {
+/// Draws an icon rendered at device pixels with its top-left at (x, y).
+pub fn draw_icon(
+    cr: &cairo::Context,
+    img: &cairo::ImageSurface,
+    x: f64,
+    y: f64,
+    scale: f64,
+    alpha: f64,
+) {
+    cr.save().ok();
+    cr.translate(x, y);
+    cr.scale(1.0 / scale, 1.0 / scale);
+    cr.set_source_surface(img, 0.0, 0.0).ok();
+    cr.paint_with_alpha(alpha).ok();
+    cr.restore().ok();
+}
+
+pub fn text_layout(
+    cr: &cairo::Context,
+    font: &str,
+    text: &str,
+    px: f64,
+    bold: bool,
+) -> pango::Layout {
     let layout = pangocairo::functions::create_layout(cr);
     let mut fd = pango::FontDescription::from_string(font);
     fd.set_absolute_size(px * pango::SCALE as f64);
@@ -462,7 +515,7 @@ fn text_layout(cr: &cairo::Context, font: &str, text: &str, px: f64, bold: bool)
     layout
 }
 
-fn rounded(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+pub fn rounded(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     use std::f64::consts::FRAC_PI_2 as Q;
     cr.new_sub_path();
     cr.arc(x + w - r, y + r, r, -Q, 0.0);
