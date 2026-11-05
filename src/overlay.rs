@@ -59,7 +59,6 @@ impl Rgba {
 pub struct Theme {
     pub surface: Rgba,
     pub on_surface: Rgba,
-    pub on_surface_variant: Rgba,
     pub primary: Rgba,
     pub outline: Rgba,
 }
@@ -69,7 +68,6 @@ impl Theme {
         let mut t = Theme {
             surface: Rgba(0.11, 0.11, 0.13, 1.0),
             on_surface: Rgba(0.90, 0.90, 0.92, 1.0),
-            on_surface_variant: Rgba(0.62, 0.62, 0.66, 1.0),
             primary: Rgba(0.55, 0.70, 1.0, 1.0),
             outline: Rgba(0.35, 0.35, 0.40, 1.0),
         };
@@ -84,7 +82,6 @@ impl Theme {
         for (k, slot) in [
             ("surface", &mut t.surface),
             ("on_surface", &mut t.on_surface),
-            ("on_surface_variant", &mut t.on_surface_variant),
             ("primary", &mut t.primary),
             ("outline", &mut t.outline),
         ] {
@@ -153,8 +150,9 @@ impl Overlay {
             .is_some_and(|l| l.wl_surface() == surface)
     }
 
-    /// Shows `keyboard`, or replaces what an open overlay shows.
+    /// Shows `keyboard` in place of whatever the overlay shows.
     pub fn open(&mut self, qh: &QueueHandle<State>, mode: Mode, keyboard: Keyboard, cfg: &Config) {
+        self.close();
         self.theme = Theme::load();
         self.font = cfg.font.as_deref().unwrap_or("sans").to_string();
         let (w, h) = keyboard.size();
@@ -168,12 +166,6 @@ impl Overlay {
         self.keyboard = Some(keyboard);
         self.stale = true;
         self.mode = Some(mode);
-        if let Some(layer) = &self.layer {
-            layer.set_keyboard_interactivity(input);
-            layer.set_size(w, h);
-            layer.commit();
-            return;
-        }
         let g = &self.globals;
         let surface = g.compositor.create_surface(qh);
         let layer =
@@ -304,7 +296,7 @@ impl Overlay {
     }
 }
 
-/// The rounded background every view is drawn on.
+/// The rounded background of the panel.
 fn card(cr: &cairo::Context, t: &Theme, (w, h): (f64, f64)) {
     rounded(cr, 0.5, 0.5, w - 1.0, h - 1.0, 16.0);
     t.surface.set(cr);

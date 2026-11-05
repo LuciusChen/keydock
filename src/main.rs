@@ -48,7 +48,7 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_m
 
 use config::Config;
 use desktop::{DesktopIndex, IconFinder};
-use keyboard::{Keyboard, Row};
+use keyboard::{KeyApp, Keyboard};
 use layout::Layout;
 use overlay::{Mode, Overlay};
 use tracker::MinimizeCheck;
@@ -399,7 +399,7 @@ impl State {
         out
     }
 
-    fn row(&mut self, key: char, app_id: &str, name: Option<&str>) -> Row {
+    fn key_app(&mut self, key: char, app_id: &str, name: Option<&str>) -> KeyApp {
         let entry = self.desktop.lookup(app_id).cloned();
         let icon = entry
             .as_ref()
@@ -410,7 +410,7 @@ impl State {
             .or(entry.map(|e| e.name))
             .unwrap_or_else(|| app_id.to_string());
         let running = self.windows.tracker.of_app(app_id).next().is_some();
-        Row {
+        KeyApp {
             key,
             name,
             icon,
@@ -463,45 +463,29 @@ impl State {
         }
     }
 
-    /// The pinned apps on their letters and `targets` on the number keys.
-    fn app_rows(&mut self, cfg: &Config, targets: &[String]) -> Vec<Row> {
-        let mut rows: Vec<Row> = cfg
-            .apps
-            .iter()
-            .map(|a| self.row(a.key, &a.app_id, a.name.as_deref()))
-            .collect();
-        rows.extend(self.numbered_rows(targets));
-        rows
-    }
-
     /// The open, unpinned apps on the number keys.
-    fn numbered_rows(&mut self, targets: &[String]) -> Vec<Row> {
+    fn numbered_apps(&mut self, targets: &[String]) -> Vec<KeyApp> {
         targets
             .iter()
             .enumerate()
-            .map(|(i, id)| self.row(char::from(b'1' + i as u8), id, None))
+            .map(|(i, id)| self.key_app(char::from(b'1' + i as u8), id, None))
             .collect()
     }
 
-    fn open_keyboard(
-        &mut self,
-        mode: Mode,
-        title: String,
-        prefix: String,
-        apps: Vec<Row>,
-        labels: HashMap<String, String>,
-        cfg: &Config,
-    ) -> Result<(), String> {
-        let keyboard = Keyboard {
-            layout: Layout::load(cfg.layout_name(&layout::device_names()))?,
-            title,
-            prefix,
-            apps,
-            labels,
-        };
+    /// The pinned apps on their letters and `targets` on the number keys.
+    fn all_apps(&mut self, cfg: &Config, targets: &[String]) -> Vec<KeyApp> {
+        let mut apps: Vec<KeyApp> = cfg
+            .apps
+            .iter()
+            .map(|a| self.key_app(a.key, &a.app_id, a.name.as_deref()))
+            .collect();
+        apps.extend(self.numbered_apps(targets));
+        apps
+    }
+
+    fn show(&mut self, mode: Mode, keyboard: Keyboard, cfg: &Config) {
         self.overlay_serial += 1;
         self.overlay.open(&self.qh, mode, keyboard, cfg);
-        Ok(())
     }
 
     fn open_peek(&mut self, layer: Option<&str>) -> Result<(), String> {
@@ -515,12 +499,18 @@ impl State {
             None => {
                 self.refresh_desktop();
                 let targets = self.unpinned(&cfg);
-                let apps = self.app_rows(&cfg, &targets);
+                let apps = self.all_apps(&cfg, &targets);
                 (cfg.key_label().to_string(), apps, HashMap::new())
             }
         };
-        let title = format!("{prefix} + …");
-        self.open_keyboard(Mode::Peek, title, prefix, apps, labels, &cfg)?;
+        let keyboard = Keyboard {
+            layout: Layout::current(&cfg)?,
+            title: format!("{prefix} + …"),
+            prefix,
+            apps,
+            labels,
+        };
+        self.show(Mode::Peek, keyboard, &cfg);
         // In case the release never arrives, as nothing else can close a peek.
         self.close_overlay_later(PEEK_MAX);
         Ok(())
@@ -531,11 +521,16 @@ impl State {
         let cfg = Config::load()?;
         self.refresh_desktop();
         let targets = self.unpinned(&cfg);
-        let apps = self.app_rows(&cfg, &targets);
-        let title = i18n::strings(&i18n::languages()).browse_hint.to_string();
-        let prefix = cfg.key_label().to_string();
+        let keyboard = Keyboard {
+            layout: Layout::current(&cfg)?,
+            title: i18n::strings(&i18n::languages()).browse_hint.to_string(),
+            prefix: cfg.key_label().to_string(),
+            apps: self.all_apps(&cfg, &targets),
+            labels: HashMap::new(),
+        };
         self.overlay_targets = targets;
-        self.open_keyboard(Mode::Browse, title, prefix, apps, HashMap::new(), &cfg)
+        self.show(Mode::Browse, keyboard, &cfg);
+        Ok(())
     }
 
     /// An unpinned letter: the open apps on the number keys, to pin one to it.
@@ -556,17 +551,22 @@ impl State {
                 text.assign_section, text.assign_hint
             )
         };
-        let apps = self.numbered_rows(&targets);
-        let prefix = cfg.key_label().to_string();
+        let keyboard = Keyboard {
+            layout: Layout::current(&cfg)?,
+            title,
+            prefix: cfg.key_label().to_string(),
+            apps: self.numbered_apps(&targets),
+            labels: HashMap::new(),
+        };
         self.overlay_targets = targets;
-        self.open_keyboard(Mode::Assign(key), title, prefix, apps, HashMap::new(), &cfg)?;
+        self.show(Mode::Assign(key), keyboard, &cfg);
         if nothing_to_pin {
             self.close_overlay_later(Duration::from_millis(1500));
         }
         Ok(())
     }
 
-    /// Closes the overlay shortly, unless another one opened meanwhile.
+    /// Closes the overlay after `delay`, unless another one opened meanwhile.
     fn close_overlay_later(&mut self, delay: Duration) {
         let serial = self.overlay_serial;
         let _ = self

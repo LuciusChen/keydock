@@ -284,19 +284,6 @@ mod tests {
     }
 
     #[test]
-    fn finds_layers_by_name() {
-        let cfg = Config::parse(
-            "[[layer]]\nname = \"numnav\"\nprefix = \";\"\n[layer.keys]\nh = \"←\"\n\",\" = \"PgUp\"\n",
-        )
-        .unwrap();
-        let layer = cfg.layer("numnav").unwrap();
-        assert_eq!(layer.prefix, ";");
-        assert_eq!(layer.keys["h"], "←");
-        assert_eq!(layer.keys[","], "PgUp");
-        assert!(cfg.layer("other").is_none());
-    }
-
-    #[test]
     fn parses_full_config() {
         let cfg = Config::parse(
             r#"

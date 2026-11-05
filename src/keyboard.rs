@@ -7,7 +7,7 @@ use crate::layout::Layout;
 use crate::overlay::{Theme, draw_icon, rounded, text_layout};
 
 /// An app on a key: a pinned letter, or a number for an open, unpinned app.
-pub struct Row {
+pub struct KeyApp {
     pub key: char,
     pub name: String,
     pub icon: Option<PathBuf>,
@@ -27,13 +27,13 @@ pub struct Keyboard {
     /// The keys held for the layer, e.g. "Tab" or "Super+;": drawn highlighted.
     pub prefix: String,
     /// Apps, drawn as icons.
-    pub apps: Vec<Row>,
+    pub apps: Vec<KeyApp>,
     /// Text for other keys, by key label.
     pub labels: HashMap<String, String>,
 }
 
 impl Keyboard {
-    fn app(&self, label: &str) -> Option<&Row> {
+    fn app(&self, label: &str) -> Option<&KeyApp> {
         let mut chars = label.chars();
         let (Some(c), None) = (chars.next(), chars.next()) else {
             return None;

@@ -31,6 +31,11 @@ struct File {
 }
 
 impl Layout {
+    /// The layout for the keyboards connected now.
+    pub fn current(cfg: &Config) -> Result<Layout, String> {
+        Self::load(cfg.layout_name(&device_names()))
+    }
+
     /// The user's layout of that name, else the built-in one.
     pub fn load(name: &str) -> Result<Layout, String> {
         let path = Config::path().with_file_name(format!("layouts/{name}.toml"));
@@ -87,7 +92,7 @@ fn split_width(token: &str) -> (&str, f64) {
 }
 
 /// The names of the connected input devices.
-pub fn device_names() -> Vec<String> {
+fn device_names() -> Vec<String> {
     std::fs::read_to_string("/proc/bus/input/devices")
         .unwrap_or_default()
         .lines()

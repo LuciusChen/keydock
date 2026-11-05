@@ -115,7 +115,6 @@ Without the file a built-in dark palette is used. Any of these keys can be set:
 ```toml
 surface = "#282828"
 on_surface = "#fbf1c7"
-on_surface_variant = "#ebdbb2"
 primary = "#b8bb26"
 outline = "#57514e"
 ```
