@@ -508,7 +508,23 @@ impl State {
 
     fn show(&mut self, mode: Mode, keyboard: Keyboard, cfg: &Config) {
         self.overlay_serial += 1;
-        self.overlay.open(&self.qh, mode, keyboard, cfg);
+        let limit = self.smallest_output();
+        self.overlay.open(&self.qh, mode, keyboard, limit, cfg);
+    }
+
+    /// The narrowest and the lowest of the outputs, as the overlay's output is
+    /// the compositor's choice; 0 where no output reports a size.
+    fn smallest_output(&self) -> (u32, u32) {
+        let sizes: Vec<(u32, u32)> = self
+            .output_state
+            .outputs()
+            .filter_map(|o| self.output_state.info(&o)?.logical_size)
+            .map(|(w, h)| (w.max(0) as u32, h.max(0) as u32))
+            .collect();
+        (
+            sizes.iter().map(|s| s.0).min().unwrap_or(0),
+            sizes.iter().map(|s| s.1).min().unwrap_or(0),
+        )
     }
 
     fn open_peek(&mut self, layer: Option<&str>) -> Result<(), String> {

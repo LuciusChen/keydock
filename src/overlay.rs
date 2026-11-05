@@ -154,8 +154,16 @@ impl Overlay {
             .is_some_and(|l| l.wl_surface() == surface)
     }
 
-    /// Shows `keyboard` in place of whatever the overlay shows.
-    pub fn open(&mut self, qh: &QueueHandle<State>, mode: Mode, keyboard: Keyboard, cfg: &Config) {
+    /// Shows `keyboard` in place of whatever the overlay shows, asking for no
+    /// more than `limit`, as wlroots compositors grant whatever is asked.
+    pub fn open(
+        &mut self,
+        qh: &QueueHandle<State>,
+        mode: Mode,
+        keyboard: Keyboard,
+        limit: (u32, u32),
+        cfg: &Config,
+    ) {
         self.close();
         self.theme = Theme::load();
         self.font = cfg.font.as_deref().unwrap_or("sans").to_string();
@@ -186,7 +194,8 @@ impl Overlay {
                 .set_input_region(Some(region.wl_region()));
         }
         layer.set_anchor(Anchor::empty());
-        layer.set_size(w, h);
+        let fit = fit_within((w, h), limit);
+        layer.set_size((w as f64 * fit) as u32, (h as f64 * fit) as u32);
         if let (Some(f), Some(v)) = (&g.fractional, &g.viewporter) {
             self.fractional = Some(f.get_fractional_scale(layer.wl_surface(), qh, Scale));
             self.viewport = Some(v.get_viewport(layer.wl_surface(), qh, Noop));
