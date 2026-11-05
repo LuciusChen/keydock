@@ -156,7 +156,6 @@ impl Overlay {
     /// Shows `keyboard`, or replaces what an open overlay shows.
     pub fn open(&mut self, qh: &QueueHandle<State>, mode: Mode, keyboard: Keyboard, cfg: &Config) {
         self.theme = Theme::load();
-        self.theme.surface = self.theme.surface.alpha(cfg.opacity());
         self.font = cfg.font.as_deref().unwrap_or("sans").to_string();
         let (w, h) = keyboard.size();
         let (w, h) = (w.ceil() as u32, h.ceil() as u32);

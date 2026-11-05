@@ -3,6 +3,10 @@
 Pin applications to letter keys on wlroots compositors (labwc, niri, Hyprland, sway).
 The examples bind Super+letter; any trigger that runs `keydock key <letter>` works.
 
+Hold the trigger key for a moment and a keyboard shows what each key does:
+
+![Pinned apps on their letters while Tab is held](docs/images/peek-apps.png)
+
 - **A pinned letter** focuses the app, hides it when it is already focused, or launches it.
   All of the app's windows come forward together and the most recently used one ends on top.
   Windows you minimized one by one stay minimized. An app that closed to the tray is restored
@@ -16,9 +20,10 @@ The examples bind Super+letter; any trigger that runs `keydock key <letter>` wor
   so the numbers change as you switch apps.
 - **An unpinned letter** opens the overlay so you can pin an open app to that letter;
   with no open app to pin, it says so and closes itself.
-- **Peeking**: when the trigger key is held for a moment, the same keyboard appears, and it goes away when the key is released or a letter is pressed. It takes no key
-  or pointer input, so letters keep switching apps while it shows. Other layers can be shown the same
-  way. This needs a trigger that reports both press and release, such as a kanata layer key;
+- **Peeking**: when the trigger key is held for a moment, the same keyboard appears, and it goes
+  away when the key is released or a letter is pressed. It takes no key or pointer input, so
+  letters keep switching apps while it shows. Other layers can be shown the same way. This needs
+  a trigger that reports both press and release, such as a kanata layer key;
   see [Peeking with kanata](#peeking-with-kanata).
 
 keydock tracks its own most-recently-used window order through
@@ -48,15 +53,13 @@ keydock daemon         run the background service (other commands start it if ne
 ```toml
 font = "sans"          # optional overlay font
 hide = "auto"          # auto | minimize | previous (focus the previous app)
-key_label = "Super"    # modifier name shown in the overlay, e.g. "Hyper"
+key_label = "Super"    # the trigger's name: titles the keyboard, highlights that key
 warp = "super+ctrl+alt+shift+p"  # chord for the compositor's cursor warp; "" disables it
-opacity = 1.0          # overlay background opacity, 0.0 to 1.0
 
 [[app]]
 key = "c"
 app_id = "kitty"       # as shown by `keydock status`; "emacs" also matches "emacs-32-0-50"
 exec = "kitty"         # launch command when no window exists
-
 ```
 
 ### Layers
@@ -76,6 +79,8 @@ Left = "Snap left"
 [layer.translations.zh_CN]   # or "zh" for every Chinese locale
 q = "关闭"
 ```
+
+![A layer of window shortcuts while Super is held](docs/images/peek-super.png)
 
 ### Keyboard layouts
 
@@ -101,6 +106,8 @@ rows = [
   "_:3 Super Space",
 ]
 ```
+
+![The corne layout](docs/images/peek-corne.png)
 
 Overlay colors are read from `~/.config/keydock/colors.toml` each time the overlay opens.
 Without the file a built-in dark palette is used. Any of these keys can be set:
@@ -166,9 +173,13 @@ keyboard highlights Tab. Run the commands as the desktop user when kanata runs a
 
 (deflayermap (apps)
   a (cmd keydock key a)
-  ;; ... one line per letter
+  ;; ... one line per letter, and 1 to 9 for the open, unpinned apps
+  1 (cmd keydock key 1)
   / (cmd keydock overlay))
 ```
+
+Any key can show a layer of its own with `keydock peek <name>`, including a modifier, which can
+stay a modifier: `(multi lmet (cmd keydock peek windows) (on-release tap-vkey peek-off))`.
 
 A layer whose keys do not go through keydock can hide the keyboard on the first key, so it
 does not cover what you are doing:

@@ -101,13 +101,13 @@ pub fn paint(
         let held = kb.is_held(label);
         rounded(cr, x, y, w, h, 7.0);
         match (held, used) {
-            (true, _) => t.primary.alpha(0.30),
-            (_, true) => t.primary.alpha(0.12),
-            _ => t.on_surface.alpha(0.04),
+            (true, _) => t.primary.alpha(0.45),
+            (_, true) => t.primary.alpha(0.22),
+            _ => t.on_surface.alpha(0.07),
         }
         .set(cr);
         cr.fill_preserve().ok();
-        t.outline.alpha(0.6).set(cr);
+        t.outline.set(cr);
         cr.set_line_width(1.0);
         cr.stroke().ok();
 
@@ -116,12 +116,12 @@ pub fn paint(
         } else {
             label.to_string()
         };
-        let color = match (held, used) {
-            (true, _) => t.primary,
-            (_, true) => t.on_surface,
-            _ => t.on_surface_variant,
+        let color = if held || used {
+            t.on_surface
+        } else {
+            t.on_surface.alpha(0.65)
         };
-        let l = layout(&text, 10.5, held);
+        let l = layout(&text, 11.0, held);
         color.set(cr);
         cr.move_to(x + 5.0, y + 3.0);
         pangocairo::functions::show_layout(cr, &l);
